@@ -4,7 +4,7 @@
 
 **High-resolution 3D geometry refinement built upon Sparc3D.**
 
-[International Website](http://hi3d.ai/) · [China Website](https://www.hi3d.cn/)
+**[Live Demo](https://huggingface.co/spaces/ilcve21/Sparc3D)** · [Hugging Face](https://huggingface.co/hi3d-official/Hi3Dv1.0) · [International Website](http://hi3d.ai/) · [China Website](https://www.hi3d.cn/)
 
 Planned open-source release: October 23, 2026.
 

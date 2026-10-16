@@ -4,7 +4,7 @@
 
 **基于 Sparc3D 的高分辨率 3D 几何细化模型。**
 
-[国际官网](http://hi3d.ai/) · [国内官网](https://www.hi3d.cn/)
+**[在线体验](https://huggingface.co/spaces/ilcve21/Sparc3D)** · [Hugging Face 项目主页](https://huggingface.co/hi3d-official/Hi3Dv1.0) · [国际官网](http://hi3d.ai/) · [国内官网](https://www.hi3d.cn/)
 
 计划于 2026 年 10 月 23 日开源。
 
