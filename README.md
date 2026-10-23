@@ -6,6 +6,8 @@
 
 **[Live Demo](https://huggingface.co/spaces/ilcve21/Sparc3D)** · [Hugging Face](https://huggingface.co/hi3d-official/Hi3Dv1.0) · [International Website](http://hi3d.ai/) · [China Website](https://www.hi3d.cn/)
 
+**[Technical Report (PDF)](https://github.com/hi3d-official/Hi3Dv1.0/blob/main/docs/Hi3D_v1.0_Technical_Report.pdf)** · [Download PDF](https://github.com/hi3d-official/Hi3Dv1.0/raw/refs/heads/main/docs/Hi3D_v1.0_Technical_Report.pdf)
+
 Released on October 23, 2026.
 
 ## Overview
