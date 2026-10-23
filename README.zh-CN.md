@@ -6,6 +6,8 @@
 
 **[在线体验](https://huggingface.co/spaces/ilcve21/Sparc3D)** · [Hugging Face 项目主页](https://huggingface.co/hi3d-official/Hi3Dv1.0) · [国际官网](http://hi3d.ai/) · [国内官网](https://www.hi3d.cn/)
 
+**[技术报告（PDF）](https://github.com/hi3d-official/Hi3Dv1.0/blob/main/docs/Hi3D_v1.0_Technical_Report.pdf)** · [下载 PDF](https://github.com/hi3d-official/Hi3Dv1.0/raw/refs/heads/main/docs/Hi3D_v1.0_Technical_Report.pdf)
+
 已于 2026 年 10 月 23 日公开发布。
 
 ## 项目介绍
