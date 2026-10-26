@@ -85,7 +85,8 @@ class SparseMultiHeadAttention(nn.Module):
             self.to_q = nn.Linear(channels, channels, bias=True)
             self.to_kv = nn.Linear(self.ctx_channels, channels * 2, bias=True)
         self.to_out = nn.Linear(channels, channels)
-        self._zero_rows: dict[tuple, torch.Tensor] = {}
+        # the zero condition's output row by token count (None: its rows are not all equal)
+        self._zero_rows: dict[tuple, torch.Tensor | None] = {}
 
     @staticmethod
     def _linear(
@@ -162,7 +163,7 @@ class SparseMultiHeadAttention(nn.Module):
         return (x.feats.shape[0], x.feats.dtype, x.device, self.to_kv, self.to_out)
 
     def zero_context_row(self, x: SparseTensor) -> torch.Tensor | None:
-        """The output row ``zero_context`` found for ``x``'s token count, or None yet."""
+        """The output row ``zero_context`` found for ``x``'s token count, or None (not yet, or not uniform)."""
         return self._zero_rows.get(self._zero_key(x))
 
     def zero_context(self, h: SparseTensor, context: torch.Tensor) -> SparseTensor:
@@ -171,10 +172,15 @@ class SparseMultiHeadAttention(nn.Module):
         Zero context tokens project to ``to_kv``'s bias: identical keys, so every query
         weighs the identical values uniformly and every token gets the same output row.
         This runs the full path and keeps that row (when every token's row is equal) for
-        ``zero_context_row``: ``[1, C]``, which the residual add broadcasts.
+        ``zero_context_row``: ``[1, C]``, which the residual add broadcasts. The rows can
+        differ in their last bits (the kernel's softmax rounds per query); that answer is
+        kept too (None), so later calls run the full path without comparing again.
         """
+        key = self._zero_key(h)
+        if key in self._zero_rows:
+            return self(h, context)
         output = self(h, context)
         first = output.feats[:1]
-        if torch.equal(output.feats, first.expand_as(output.feats)):
-            self._zero_rows = {self._zero_key(h): first.clone()}
+        uniform = torch.equal(output.feats, first.expand_as(output.feats))
+        self._zero_rows = {key: first.clone() if uniform else None}
         return output
