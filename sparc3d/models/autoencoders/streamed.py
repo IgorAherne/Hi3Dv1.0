@@ -1000,7 +1000,6 @@ class StreamedDecoder:
         """Decode latents (``coords`` ``[N, 4]`` as batch, x, y, z; ``feats`` denormalised ``[N, 32]``)."""
         decoder = self.decoder
         with torch.inference_mode(), torch.autocast("cuda"):
-            self._release()           # what earlier work left cached would sit under the latent level
             self._begin({"sweep": "latent", "level": 0, "rows": int(coords.shape[0]),
                          "alloc_before_mib": torch.cuda.memory_allocated(self.device) / 2**20})
             level, feat, matrix = self._latent_level(coords, feats, resolution)
