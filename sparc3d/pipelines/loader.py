@@ -1,7 +1,8 @@
 """Safe local and Hugging Face artifact loading for the public pipeline.
 
-Modified for Spellcast3D: load_transformer(..., device=) builds the network without storage and loads the
-checkpoint straight onto that device (the same tensors, without ~10 GB of host memory for a float32 copy).
+Modified for Spellcast3D: load_transformer(..., device=) builds the network without storage and makes the
+checkpoint's tensors, loaded straight onto that device, its parameters (the same tensors, without ~10 GB of host
+memory for a float32 copy, and with one copy of the model on the device while it loads).
 """
 
 from __future__ import annotations
@@ -203,9 +204,9 @@ def load_transformer(root: Path, artifact_name: str, device: Any = None) -> Any:
         artifact_name: ``"transformer_512"`` or ``"transformer_1024"``.
         device: Load onto this device instead: the network is built on the meta
             device (no float32 initialisation on the host, which peaks near 10 GB),
-            given storage on ``device`` in the dtypes the construction ends with, the
-            checkpoint copied in as below and the rotary frequencies (buffers the
-            checkpoint does not hold) recomputed - the same tensors, bit for bit.
+            the checkpoint's tensors, loaded onto ``device``, become its parameters
+            (one copy of the model there, not two) and the rotary frequencies (buffers
+            the checkpoint does not hold) are recomputed - the same tensors, bit for bit.
 
     Returns:
         Transformer in evaluation mode on the CPU (or ``device``).
@@ -228,15 +229,25 @@ def load_transformer(root: Path, artifact_name: str, device: Any = None) -> Any:
         import torch
         from sparc3d.nn.rope import RotaryPositionEmbedder
 
+        device = torch.device(device)
         with torch.device("meta"):
             model = Sparc3DTransformer(config)
-        model = model.to_empty(device=device)
-        model.load_state_dict(
-            load_file(str(artifact / "model.safetensors"), device=str(device)), strict=True
-        )
+        state = load_file(str(artifact / "model.safetensors"), device=str(device))
+        expected = model.state_dict()
+        for name, tensor in state.items():
+            # assign=True keeps the checkpoint's dtypes: give each tensor the dtype
+            # the construction ends with (the CPU path's copy_ converts the same way)
+            if name in expected and tensor.dtype != expected[name].dtype:
+                state[name] = tensor.to(expected[name].dtype)
+        model.load_state_dict(state, strict=True, assign=True)
+        del state, expected
         for module in model.modules():
             if isinstance(module, RotaryPositionEmbedder):
-                module.reset_freqs()
+                module.reset_freqs(device)
+        left = [name for name, tensor in (*model.named_parameters(), *model.named_buffers())
+                if tensor.is_meta]
+        if left:
+            raise RuntimeError(f"tensors without storage after the load: {left[:5]}")
         return model.eval()
     model = Sparc3DTransformer(config)
     model.load_state_dict(

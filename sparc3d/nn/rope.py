@@ -41,9 +41,12 @@ class RotaryPositionEmbedder(nn.Module):
         freqs = torch.arange(self.freq_dim, dtype=torch.float32) / self.freq_dim
         return 1.0 / (10000**freqs)
 
-    def reset_freqs(self) -> None:
-        """Recompute the frequencies (a non-persistent buffer) where the module lives, as at construction."""
-        device = self.freqs.device
+    def reset_freqs(self, device: torch.device | str | None = None) -> None:
+        """Recompute the frequencies (a non-persistent buffer) as at construction, on the host, and put them on
+        ``device`` (default: where the module lives; the host for a module on the meta device)."""
+        if device is None:
+            device = self.freqs.device
+        device = torch.device(device)
         self.freqs = self._base_freqs().to("cpu" if device.type == "meta" else device)
 
     @staticmethod
