@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from ... import accel
+from ... import accel, fused
 from ...norm import LayerNorm32
 from ..attention import SparseMultiHeadAttention
 from ..basic import SparseTensor
@@ -95,8 +95,6 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
     ) -> SparseTensor:
         """``norm(x)`` [then ``* (1 + scale) + shift``]: the eager ops, or one fused kernel (accel.FUSED)."""
         if accel.fused_for(x.feats) and len(x.layout) == 1 and x.feats.is_contiguous():
-            from ... import fused
-
             dtype = x.feats.dtype
             return x.replace(fused.norm_modulate(
                 x.feats, norm.eps, norm.weight, norm.bias,

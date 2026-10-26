@@ -15,6 +15,8 @@ from typing import Any
 
 import torch
 
+from sparc3d.nn import accel
+
 from .output import Sparc3DPipelineOutput
 from .progress import Sparc3DProgressEvent
 
@@ -409,8 +411,6 @@ class Sparc3DPipeline:
             device="cpu",
             dtype=torch.float32,
         ).to(self._device)
-        from sparc3d.nn import accel
-
         sample = SparseTensor(feats=noise, coords=batched_coords)
         negative_condition = accel.zero_condition_like(condition)
         timesteps = self.scheduler.set_timesteps(
@@ -480,7 +480,6 @@ class Sparc3DPipeline:
 
         ``time_value``: ``float(timestep)``, when the caller has it on the host.
         """
-        from sparc3d.nn import accel
         from sparc3d.schedulers.schedule import apply_effective_guidance
 
         model_timestep = (1000.0 * timestep).reshape(1)

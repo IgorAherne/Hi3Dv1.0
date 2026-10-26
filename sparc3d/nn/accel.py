@@ -9,7 +9,10 @@ process) turns the work on or off:
     "0", "off", "false", "no"         the original code path, line for line
 
 ``SPARC3D_FUSED`` ("1"/"on"; off when unset; ``FUSED`` in a running process): the blocks' elementwise chains as
-fused Triton kernels (sparc3d.nn.fused) - a change of rounding, not bit for bit, so off unless asked for.
+fused Triton kernels (sparc3d.nn.fused) - a change of rounding, not bit for bit, so off unless asked for. Where a
+fused kernel runs, the OFF items of the eager chain it replaces do nothing: the self-attention's fused path ignores
+rope_cache (its rotary phases always come from the pass's cache), rms_inplace, rope_inplace and qkv_inplace, and
+the fused norm modulation ignores broadcast.
 
 Per-pass caches (the sample's coordinates are fixed through a pass, and the sample tensors of a pass share one
 spatial cache): the downsample's mapping, spconv's index pairs and grid, the rotary phases, flash-attn's cumulative
@@ -31,6 +34,8 @@ import os
 from collections.abc import Callable
 
 import torch
+
+from sparc3d.nn import fused
 
 
 def _from_env() -> bool:
@@ -71,9 +76,8 @@ def fused_for(x: torch.Tensor) -> bool:
     """Whether the fused kernels take a block's work on ``x`` (the switches on, the kernels usable here)."""
     if not (ENABLED and FUSED):
         return False
-    from sparc3d.nn import fused
-
     return fused.usable(x)
+
 
 self_attention: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] | None = None
 

@@ -15,6 +15,8 @@ from numbers import Integral, Real
 import torch
 from torch import Tensor
 
+from sparc3d.nn import accel
+
 DEFAULT_NUM_INFERENCE_STEPS = 25
 """Integrator updates run per pass unless the caller asks for another count."""
 
@@ -87,8 +89,6 @@ def apply_effective_guidance(
 
 def _same_element(timestep: float | Tensor, expected: Tensor) -> bool:
     """Whether ``timestep`` is ``expected`` itself (the schedule's element handed back)."""
-    from sparc3d.nn import accel
-
     return (
         accel.on("host_times")
         and isinstance(timestep, Tensor)

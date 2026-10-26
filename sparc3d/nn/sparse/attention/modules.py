@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ... import accel
+from ... import accel, fused
 from ...rope import RotaryPositionEmbedder
 from ..basic import SparseTensor
 from .full_attn import sparse_scaled_dot_product_attention
@@ -84,9 +84,9 @@ class SparseMultiHeadAttention(nn.Module):
         else:
             self.to_q = nn.Linear(channels, channels, bias=True)
             self.to_kv = nn.Linear(self.ctx_channels, channels * 2, bias=True)
+            # the zero condition's output row by token count (None: its rows are not all equal)
+            self._zero_rows: dict[tuple, torch.Tensor | None] = {}
         self.to_out = nn.Linear(channels, channels)
-        # the zero condition's output row by token count (None: its rows are not all equal)
-        self._zero_rows: dict[tuple, torch.Tensor | None] = {}
 
     @staticmethod
     def _linear(
@@ -113,8 +113,6 @@ class SparseMultiHeadAttention(nn.Module):
             qkv = self._fused_pre(self._linear(self.to_qkv, x), 3)
             assert isinstance(qkv, SparseTensor)
             if accel.fused_for(qkv.feats) and self.head_dim == 96 and qkv.feats.is_contiguous():
-                from ... import fused
-
                 fused.rope_rms_(qkv.feats, self._rope_phases(qkv), self.q_rms_norm.gamma,
                                 self.k_rms_norm.gamma, self.q_rms_norm.scale)
                 return self._attend_out(qkv)

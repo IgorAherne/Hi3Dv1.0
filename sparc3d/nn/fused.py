@@ -8,11 +8,11 @@ the rotary embedding and the RMS norm. The kernels here do each chain in one rea
     rope_rms_(qkv, phases, gamma_q, gamma_k, scale)      in place on the packed qkv [N, 3, H, 96]: q and k
                                                          rotated, then RMS-normalised and scaled
 
-Every value is rounded to fp16 where the eager chain rounds it (by inline PTX: Triton folds a plain round trip) (after LayerNorm32, after the modulation's product
-and sum, after the rotation, after the RMS norm), and the rotation multiplies as PyTorch's complex product does, so
-only the two reductions (LayerNorm's mean and variance, the norm of q / k) are summed in another order: a change of
-rounding, which the samplers amplify into a different sample of the same quality - judged end to end before the
-switch is turned on. ``check`` runs every variant the blocks use once against the eager ops on a small table; a card
+Every value is rounded to fp16 where the eager chain rounds it (after LayerNorm32, after the modulation's product
+and sum, after the rotation, after the RMS norm; by inline PTX, since Triton folds a plain round trip away), and the
+rotation multiplies as PyTorch's complex product does, so only the two reductions (LayerNorm's mean and variance,
+the norm of q / k) are summed in another order: a change of rounding, which the samplers amplify into a different
+sample of the same quality - judged end to end before the switch is turned on. ``check`` runs every variant the blocks use once against the eager ops on a small table; a card
 or a Triton that cannot run them turns the switch off with a warning.
 """
 

@@ -14,8 +14,8 @@ It changes the numbers (the int8 logits, the fp16 partial sums): a different rou
 the samplers' rounding-only control before an engine turns it on. Usable on CUDA cards from sm_80 (Triton's int8
 mma.sync) with Triton installed; ``install`` runs ``self_check`` first and leaves the hook unset when it fails.
 
-    install(pv_f16=True) -> bool        the hook set (True) or not (False, the reason in ``state()``)
-    attention(q, k, v)                   q, k, v [N, H, 96] or [1, N, H, 96] (last dimension contiguous)
+    install(pv_f16=True, device=None) -> bool    the hook set (True) or not (False, the reason in ``state()``)
+    attention(q, k, v, pv_f16=True)               q, k, v [N, H, 96] or [1, N, H, 96] (last dimension contiguous)
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ MIN_TOKENS = 64
 LOG2E = 1.4426950408889634
 BLOCK_M, BLOCK_N, WARPS, STAGES = 128, 64, 4, 3       # the fastest of a tile sweep on an RTX 3060 (1.8x flash-attn)
 QUANT_ROWS = 64
-SMOOTH = False      # the per-channel smoothing of q and k (attention(smooth=...)): see attention
 
 _kernels: dict | None = None
 _state: dict = {"ok": None, "why": ""}
@@ -46,9 +45,9 @@ def _build() -> dict:
     from triton.language.extra import libdevice
 
     @triton.jit
-    def quant_kernel(X, Q, S, M, CH, n_rows, stride_xn, stride_xh, mult,
-                     SUB_MEAN: tl.constexpr, HAS_CH: tl.constexpr, BLOCK_R: tl.constexpr):
-        # one head's rows: (x * mult [- mean]) [* per-channel factor] -> int8 [H, N, 96] + one fp32 scale per token
+    def quant_kernel(X, Q, S, M, n_rows, stride_xn, stride_xh, mult,
+                     SUB_MEAN: tl.constexpr, BLOCK_R: tl.constexpr):
+        # one head's rows: (x * mult [- mean]) -> int8 [H, N, 96] + one fp32 scale per token
         pid = tl.program_id(0)
         h = tl.program_id(1)
         rows = pid * BLOCK_R + tl.arange(0, BLOCK_R)
@@ -61,9 +60,6 @@ def _build() -> dict:
         if SUB_MEAN:
             xa = xa - tl.load(M + h * 96 + ca)[None, :]
             xb = xb - tl.load(M + h * 96 + cb)[None, :]
-        if HAS_CH:
-            xa = xa * tl.load(CH + h * 96 + ca)[None, :]
-            xb = xb * tl.load(CH + h * 96 + cb)[None, :]
         amax = tl.maximum(tl.maximum(tl.max(tl.abs(xa), axis=1), tl.max(tl.abs(xb), axis=1)), 1e-30)
         inv = 127.0 / amax
         qa = libdevice.rint(xa * inv[:, None])
@@ -129,40 +125,28 @@ def _build() -> dict:
     return _kernels
 
 
-def _quantize(x: torch.Tensor, mult: float = 1.0, mean: torch.Tensor | None = None,
-              channel: torch.Tensor | None = None):
+def _quantize(x: torch.Tensor, mult: float = 1.0, mean: torch.Tensor | None = None):
     k = _build()
     n, heads, _ = x.shape
     q = torch.empty((heads, n, HEAD_DIM), dtype=torch.int8, device=x.device)
     s = torch.empty((heads, n), dtype=torch.float32, device=x.device)
     k["quant"][(k["cdiv"](n, QUANT_ROWS), heads)](
-        x, q, s, mean if mean is not None else s, channel if channel is not None else s, n, x.stride(0),
-        x.stride(1), float(mult), SUB_MEAN=mean is not None, HAS_CH=channel is not None, BLOCK_R=QUANT_ROWS,
-        num_warps=4)
+        x, q, s, mean if mean is not None else s, n, x.stride(0), x.stride(1), float(mult),
+        SUB_MEAN=mean is not None, BLOCK_R=QUANT_ROWS, num_warps=4)
     return q, s
 
 
-def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pv_f16: bool = True,
-              smooth: bool | None = None) -> torch.Tensor:
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pv_f16: bool = True) -> torch.Tensor:
     """softmax(q k^T / sqrt(96)) v over one sequence; q, k, v fp16 [N, H, 96] or [1, N, H, 96], the last
-    dimension contiguous; the answer in q's shape and dtype. ``smooth`` (default SMOOTH): q's channels times
-    s = sqrt(max|k_c| / max|q_c|) and k's divided by it before they are quantised (their products unchanged), so
-    neither has a few channels that leave the others a handful of int8 levels."""
-    smooth = SMOOTH if smooth is None else smooth
+    dimension contiguous; the answer in q's shape and dtype."""
     batched = q.dim() == 4
     if batched:
         q, k, v = q[0], k[0], v[0]
     n, heads, d = q.shape
     kern = _build()
     km = k.mean(dim=0, dtype=torch.float32)        # summed in float32 inside the kernel, no float32 copy of k
-    qch = kch = None
-    if smooth:
-        kmax = torch.maximum(k.amax(dim=0).float() - km, km - k.amin(dim=0).float())
-        qmax = q.abs().amax(dim=0).float()
-        qch = (kmax.clamp_min(1e-4) / qmax.clamp_min(1e-4)).sqrt_().contiguous()
-        kch = qch.reciprocal().contiguous()
-    q8, qs = _quantize(q, mult=d ** -0.5 * LOG2E, channel=qch)
-    k8, ks = _quantize(k, mean=km, channel=kch)
+    q8, qs = _quantize(q, mult=d ** -0.5 * LOG2E)
+    k8, ks = _quantize(k, mean=km)
     o = torch.empty((n, heads, d), dtype=q.dtype, device=q.device)
     kern["attn"][(kern["cdiv"](n, BLOCK_M), heads)](
         q8, k8, qs, ks, v, o, n, v.stride(0), v.stride(1), o.stride(0), o.stride(1),
