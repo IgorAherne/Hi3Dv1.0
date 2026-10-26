@@ -193,16 +193,18 @@ def _slab_pieces(rows: torch.Tensor, grid: torch.Tensor, resolution: int, matrix
     return vd[own_vd], vd_key[own_vd], quad_keys, face_key[own_quad]
 
 
-def extract_streamed(field, max_rows: int = 1 << 20, length_thresh: int = 10000,
-                     trace: list | None = None, release: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+def extract_streamed(field, max_rows: int = 1 << 20, length_thresh: int = 10000, trace: list | None = None,
+                     release: bool = False, peaks=None) -> tuple[torch.Tensor, torch.Tensor]:
     """The reference ``fill_mesh_holes(point_to_mesh(decoded))``, piece by piece.
 
     Args:
         field: A :class:`~sparc3d.models.autoencoders.streamed.DecodedField`.
         max_rows: Decoded rows per piece, halo included.
         length_thresh: Longest boundary loop filled, as in :func:`fill_mesh_holes`.
-        trace: When given, per-phase card peaks are appended to it.
+        trace: When given, per-phase card peaks are appended to it (PyTorch's peak counters are reset
+            after each phase).
         release: Free the field's rows once every piece is read (before the merge and hole filling).
+        peaks: A :class:`~sparc3d.models.autoencoders.streamed.CardPeaks` that empties the cache.
 
     Returns:
         ``(vertices [V, 3] float32, faces [F, 3])`` on the card, in the decode's unit frame.
@@ -211,6 +213,8 @@ def extract_streamed(field, max_rows: int = 1 << 20, length_thresh: int = 10000,
 
     level, store, matrix = field.level, field.store, field.matrix
     resolution = level.resolution
+    device = level.coords.device
+    empty_cache = peaks.empty_cache if peaks is not None else torch.cuda.empty_cache
     pieces = plan_pieces(level, max_rows, HALO_BELOW, HALO_ABOVE)
     vds, vd_keys, quad_keys, face_keys = [], [], [], []
     with torch.inference_mode():
@@ -224,10 +228,9 @@ def extract_streamed(field, max_rows: int = 1 << 20, length_thresh: int = 10000,
             del kept, fetched
         if release:
             field.free()
-        _mark(trace, "extract_slabs")
-        torch.cuda.empty_cache()
+        _mark(trace, "extract_slabs", device)
+        empty_cache()
         if not vds:
-            device = level.coords.device
             return torch.zeros((0, 3), device=device), torch.zeros((0, 3), dtype=torch.int32, device=device)
 
         vd_keys = torch.cat(vd_keys)
@@ -245,10 +248,10 @@ def extract_streamed(field, max_rows: int = 1 << 20, length_thresh: int = 10000,
         del face_keys
         faces = quads[face_order][:, list(_QUAD_SPLIT)].reshape(-1, 3)
         del quads, face_order
-        _mark(trace, "extract_merge")
-        torch.cuda.empty_cache()
+        _mark(trace, "extract_merge", device)
+        empty_cache()
         faces = fill_mesh_holes_lean(vertices, faces, length_thresh)
-        _mark(trace, "fill_holes")
+        _mark(trace, "fill_holes", device)
     return vertices, faces
 
 
@@ -299,10 +302,10 @@ def fill_mesh_holes_lean(vertices: torch.Tensor, faces: torch.Tensor, length_thr
     return faces
 
 
-def _mark(trace: list | None, what: str) -> None:
+def _mark(trace: list | None, what: str, device: torch.device) -> None:
     """The card's peaks since the previous mark (the counters restart here)."""
     if trace is not None:
-        trace.append({"stage": what, "alloc_after_mib": round(torch.cuda.memory_allocated() / 2**20),
-                      "peak_alloc_mib": round(torch.cuda.max_memory_allocated() / 2**20),
-                      "peak_reserved_mib": round(torch.cuda.max_memory_reserved() / 2**20)})
-        torch.cuda.reset_peak_memory_stats()
+        trace.append({"stage": what, "alloc_after_mib": round(torch.cuda.memory_allocated(device) / 2**20),
+                      "peak_alloc_mib": round(torch.cuda.max_memory_allocated(device) / 2**20),
+                      "peak_reserved_mib": round(torch.cuda.max_memory_reserved(device) / 2**20)})
+        torch.cuda.reset_peak_memory_stats(device)

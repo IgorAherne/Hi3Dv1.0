@@ -720,11 +720,47 @@ class SlabPlan:
         return self.stores_on_card
 
 
-class StreamedDecoder:
-    """Decode latents piece by piece (see the module docstring)."""
+class CardPeaks:
+    """The card's peaks over a stretch of work, without resetting PyTorch's counters (the caller may be
+    measuring with them). PyTorch's reserve only shrinks when the cache is emptied, so its largest value
+    sampled before every :meth:`empty_cache` and at the end is the stretch's peak; when the stretch set a
+    new process peak, the counters themselves give it (the allocated peak exactly, else the largest
+    allocation sampled: a lower bound)."""
 
-    def __init__(self, decoder, plan: SlabPlan, device: torch.device):
-        self.decoder, self.plan, self.device = decoder, plan, device
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.counters = torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)
+        self.alloc = self.reserved = 0
+        self.sample()
+
+    def sample(self) -> None:
+        self.alloc = max(self.alloc, torch.cuda.memory_allocated(self.device))
+        self.reserved = max(self.reserved, torch.cuda.memory_reserved(self.device))
+
+    def empty_cache(self) -> None:
+        self.sample()
+        torch.cuda.empty_cache()
+
+    def result(self) -> tuple[int, int]:
+        """``(allocated, reserved)`` peak bytes since this was made."""
+        self.sample()
+        alloc, reserved = torch.cuda.max_memory_allocated(self.device), torch.cuda.max_memory_reserved(self.device)
+        return (alloc if alloc > self.counters[0] else self.alloc,
+                reserved if reserved > self.counters[1] else self.reserved)
+
+
+class StreamedDecoder:
+    """Decode latents piece by piece (see the module docstring).
+
+    ``trace``: time every sweep and record its card peaks, which synchronizes the card after each sweep
+    and resets PyTorch's process-wide peak counters (for profiling only). Otherwise the card's peaks over
+    the decode come from ``peaks``.
+    """
+
+    def __init__(self, decoder, plan: SlabPlan, device: torch.device, trace: bool = False,
+                 peaks: CardPeaks | None = None):
+        self.decoder, self.plan, self.device, self.trace = decoder, plan, device, trace
+        self.peaks = peaks or CardPeaks(device)
         self.streams = Streams(device)
         self.sweeps: list[dict] = []
         self.host_bytes = self.host_peak = 0
@@ -750,31 +786,40 @@ class StreamedDecoder:
 
     def _release(self) -> None:
         if torch.cuda.memory_reserved(self.device) > self.plan.release_above:
-            torch.cuda.empty_cache()
+            self.peaks.empty_cache()
 
     def _free(self, store: Store) -> None:
         if not store.on_card and store.data is not None:
             self.host_bytes -= store.nbytes
         store.free()
 
+    def _begin(self, record: dict) -> None:
+        """Start a sweep's record (traced: its clock, and the card's peak counters reset)."""
+        if self.trace:
+            torch.cuda.synchronize(self.device)
+            record["t0"] = time.perf_counter()
+            torch.cuda.reset_peak_memory_stats(self.device)
+        self.sweeps.append(record)
+
     def _pieces(self, kind: str, index: int, level: Level, channels_in: int, inputs: Sequence[Store],
                 halo: int = 1) -> list[Piece]:
-        """The sweep's pieces, and its record (the card's peak is reset for it). ``inputs``: the stores it
-        reads; those in page-locked memory cost two pieces of copies on the card (current and next)."""
+        """The sweep's pieces, and its record. ``inputs``: the stores it reads; those in page-locked memory
+        cost two pieces of copies on the card (current and next)."""
         self._release()               # the previous sweep's cached blocks would fragment this one's
         host = sum(2 * store.data.shape[1] * store.data.element_size() for store in inputs if not store.on_card)
         rows = self.plan.slab_rows(kind, index, channels_in, host)
         pieces = plan_pieces(level, rows, halo, halo)
-        record = {"sweep": kind, "level": index, "rows": level.n, "slab_rows": rows, "slabs": len(pieces),
-                  "strips": sum((p.y0, p.y1) != (0, level.resolution) for p in pieces),
-                  "host_row_bytes": host, "t0": time.perf_counter(),
-                  "widest": max((level.count(p.window(halo, halo)) for p in pieces), default=0),
-                  "alloc_before_mib": torch.cuda.memory_allocated(self.device) / 2**20}
-        torch.cuda.reset_peak_memory_stats(self.device)
-        self.sweeps.append(record)
+        self._begin({"sweep": kind, "level": index, "rows": level.n, "slab_rows": rows, "slabs": len(pieces),
+                     "strips": sum((p.y0, p.y1) != (0, level.resolution) for p in pieces),
+                     "host_row_bytes": host,
+                     "widest": max((level.count(p.window(halo, halo)) for p in pieces), default=0),
+                     "alloc_before_mib": torch.cuda.memory_allocated(self.device) / 2**20})
         return pieces
 
     def _end_sweep(self) -> None:
+        self.peaks.sample()
+        if not self.trace:
+            return
         record = self.sweeps[-1]
         torch.cuda.synchronize(self.device)
         record["seconds"] = round(time.perf_counter() - record.pop("t0"), 3)
@@ -954,9 +999,8 @@ class StreamedDecoder:
         """Decode latents (``coords`` ``[N, 4]`` as batch, x, y, z; ``feats`` denormalised ``[N, 32]``)."""
         decoder = self.decoder
         with torch.inference_mode(), torch.autocast("cuda"):
-            torch.cuda.reset_peak_memory_stats(self.device)
-            self.sweeps.append({"sweep": "latent", "level": 0, "rows": int(coords.shape[0]), "t0": time.perf_counter(),
-                                "alloc_before_mib": torch.cuda.memory_allocated(self.device) / 2**20})
+            self._begin({"sweep": "latent", "level": 0, "rows": int(coords.shape[0]),
+                         "alloc_before_mib": torch.cuda.memory_allocated(self.device) / 2**20})
             level, feat, matrix = self._latent_level(coords, feats, resolution)
             self._end_sweep()
             store = Store(feat, self.streams, self.device)

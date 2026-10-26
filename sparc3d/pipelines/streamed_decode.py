@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from sparc3d.models.autoencoders.streamed import SlabPlan, StreamedDecoder
+from sparc3d.models.autoencoders.streamed import CardPeaks, SlabPlan, StreamedDecoder
 from sparc3d.sparcubes.streamed import extract_streamed
 
 MIB = 1 << 20
@@ -87,7 +87,10 @@ class StreamedMesh:
     """The decode's grid-to-unit transform ``[4, 4]`` (the latent level's ``Point.matrix``), on the CPU."""
     seconds: dict = field(default_factory=dict)
     peak_alloc_mib: float = 0.0
+    """The card's allocated peak during the call: exact when traced or when the call set the process's
+    peak (as after the caller resets PyTorch's peak counters), else a lower bound."""
     peak_reserved_mib: float = 0.0
+    """PyTorch's reserve at its peak during the call (see :class:`CardPeaks`)."""
     host_mib: float = 0.0
     """Host memory the decode's stores used at most (those that did not fit on the card; page-locked unless
     the system refused it)."""
@@ -96,7 +99,7 @@ class StreamedMesh:
 
 def decode_and_extract(vae, latents_coords: torch.Tensor, latents_feats: torch.Tensor, structure: int,
                        budget_mib: float = 5000, device: torch.device | str = "cuda",
-                       to_cpu: bool = True) -> StreamedMesh:
+                       to_cpu: bool = True, trace: bool = False) -> StreamedMesh:
     """Decode one pass's latents and extract its mesh, the card's memory kept under ``budget_mib``.
 
     Args:
@@ -108,6 +111,8 @@ def decode_and_extract(vae, latents_coords: torch.Tensor, latents_feats: torch.T
             allocator's reserve stays within a few hundred MiB of it).
         device: The card.
         to_cpu: Return the mesh on the CPU (else it stays on the card).
+        trace: Time every sweep and phase and record its card peaks (profiling only: the card is
+            synchronized after every sweep and PyTorch's process-wide peak counters are reset).
 
     Returns:
         :class:`StreamedMesh`; vertices and faces equal those of the reference's ``_extract_mesh``.
@@ -117,18 +122,19 @@ def decode_and_extract(vae, latents_coords: torch.Tensor, latents_feats: torch.T
     """
     device = torch.device(device)
     plan = BudgetPlan(budget_mib, device)
-    decoder = StreamedDecoder(vae.decoder, plan, device)
-    torch.cuda.reset_peak_memory_stats(device)
+    peaks = CardPeaks(device)
+    decoder = StreamedDecoder(vae.decoder, plan, device, trace=trace, peaks=peaks)
     t0 = time.perf_counter()
     field_ = decoder(latents_coords.to(device), latents_feats.to(device), structure)
     torch.cuda.synchronize(device)
     t1 = time.perf_counter()
-    trace: list = []
-    torch.cuda.reset_peak_memory_stats(device)
+    records: list | None = [] if trace else None
+    if trace:
+        torch.cuda.reset_peak_memory_stats(device)
     with torch.inference_mode():
         host = 0 if field_.store.on_card else 2 * 40 * 4
         rows = plan.slab_rows("extract", 3, 40, host, reserve_bytes=PIECE_BYTES * field_.n)
-        vertices, faces = extract_streamed(field_, max_rows=rows, trace=trace, release=True)
+        vertices, faces = extract_streamed(field_, max_rows=rows, trace=records, release=True, peaks=peaks)
         if vertices.shape[0] == 0 or faces.shape[0] == 0:
             raise RuntimeError("mesh extraction produced an empty isosurface")
         faces = faces.long()
@@ -136,15 +142,16 @@ def decode_and_extract(vae, latents_coords: torch.Tensor, latents_feats: torch.T
             vertices, faces = vertices.cpu(), faces.cpu()
     torch.cuda.synchronize(device)
     t2 = time.perf_counter()
-    extract_peak = max((r["peak_alloc_mib"] for r in trace), default=0.0)
-    extract_reserved = max((r["peak_reserved_mib"] for r in trace), default=0.0)
-    sweeps = decoder.sweeps + [{"sweep": "extract", "level": 3, "slab_rows": rows, **r} for r in trace]
+    if trace:
+        peak_alloc = max([decoder.peak_alloc] + [r["peak_alloc_mib"] for r in records])
+        peak_reserved = max([decoder.peak_reserved] + [r["peak_reserved_mib"] for r in records])
+    else:
+        peak_alloc, peak_reserved = (value / MIB for value in peaks.result())
+    sweeps = decoder.sweeps + [{"sweep": "extract", "level": 3, "slab_rows": rows, **r} for r in records or []]
     return StreamedMesh(vertices, faces, field_.n, field_.matrix.detach().double().cpu(),
                         seconds={"decode": round(t1 - t0, 3), "extract": round(t2 - t1, 3)},
-                        peak_alloc_mib=max(decoder.peak_alloc, extract_peak),
-                        peak_reserved_mib=max(decoder.peak_reserved, extract_reserved),
+                        peak_alloc_mib=peak_alloc, peak_reserved_mib=peak_reserved,
                         host_mib=decoder.host_peak / MIB, sweeps=sweeps)
-
 
 WEIGHTS_MIB = 376
 """The VAE's float32 weights on the card."""
