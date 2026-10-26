@@ -82,6 +82,8 @@ class StreamedMesh:
     faces: torch.Tensor
     """``[F, 3]`` int64 (the reference's own faces are int32 unless holes were filled; its trimesh is int64)."""
     decoded_points: int
+    matrix: torch.Tensor | None = None
+    """The decode's grid-to-unit transform ``[4, 4]`` (the latent level's ``Point.matrix``), on the CPU."""
     seconds: dict = field(default_factory=dict)
     peak_alloc_mib: float = 0.0
     peak_reserved_mib: float = 0.0
@@ -135,7 +137,7 @@ def decode_and_extract(vae, latents_coords: torch.Tensor, latents_feats: torch.T
     extract_peak = max((r["peak_alloc_mib"] for r in trace), default=0.0)
     extract_reserved = max((r["peak_reserved_mib"] for r in trace), default=0.0)
     sweeps = decoder.sweeps + [{"sweep": "extract", "level": 3, "slab_rows": rows, **r} for r in trace]
-    return StreamedMesh(vertices, faces, field_.n,
+    return StreamedMesh(vertices, faces, field_.n, field_.matrix.detach().double().cpu(),
                         seconds={"decode": round(t1 - t0, 3), "extract": round(t2 - t1, 3)},
                         peak_alloc_mib=max(decoder.peak_alloc, extract_peak),
                         peak_reserved_mib=max(decoder.peak_reserved, extract_reserved),
