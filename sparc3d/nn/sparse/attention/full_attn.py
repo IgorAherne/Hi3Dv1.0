@@ -3,7 +3,8 @@
 # Adapted from Microsoft TRELLIS under the MIT License.
 # Modified for SPARC3D: variable-length flash attention only.
 # Modified for Spellcast3D: PyTorch's attention where flash-attn is missing or the card predates sm_80; an
-# engine's self-attention kernel for one sequence (sparc3d.nn.accel.self_attention).
+# engine's self-attention kernel for one sequence (sparc3d.nn.accel.self_attention); the cumulative lengths kept
+# per pass (sparc3d.nn.accel's sync saving).
 
 from __future__ import annotations
 
@@ -22,6 +23,19 @@ def _cumulative(lengths: list[int], device: torch.device) -> torch.Tensor:
     return torch.tensor(
         [0, *lengths], device=device, dtype=torch.int32
     ).cumsum(0, dtype=torch.int32)
+
+
+def _cumulative_of(tensor: SparseTensor, lengths: list[int], key: str) -> torch.Tensor:
+    """``_cumulative(lengths, tensor.device)``, kept in the tensor's spatial cache with the sync saving on: a pass's
+    layout and context length are fixed, so the host copy (a synchronisation) runs once a pass, not every call."""
+    if not accel.on("sync"):
+        return _cumulative(lengths, tensor.device)
+    shape = tuple(lengths)
+    cached = tensor.get_spatial_cache(key)
+    if cached is None or cached[0] != shape:
+        cached = (shape, _cumulative(lengths, tensor.device))
+        tensor.register_spatial_cache(key, cached)
+    return cached[1]
 
 
 def sparse_scaled_dot_product_attention(
@@ -53,7 +67,7 @@ def sparse_scaled_dot_product_attention(
     flash_attn = flash_attn_for(query.device)
     if flash_attn is None:
         return query.replace(_sdpa(query.feats, kv, query_lengths))
-    cumulative_query = _cumulative(query_lengths, query.device)
+    cumulative_query = _cumulative_of(query, query_lengths, "cu_seqlens_q")
 
     if kv is None:
         output = flash_attn.flash_attn_varlen_qkvpacked_func(
@@ -69,7 +83,7 @@ def sparse_scaled_dot_product_attention(
         query.feats,
         kv.reshape(batch * length, *kv.shape[2:]),
         cumulative_query,
-        _cumulative(key_lengths, query.device),
+        _cumulative_of(query, key_lengths, "cu_seqlens_kv"),
         max(query_lengths),
         max(key_lengths),
     )

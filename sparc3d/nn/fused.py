@@ -8,12 +8,12 @@ the rotary embedding and the RMS norm. The kernels here do each chain in one rea
     rope_rms_(qkv, phases, gamma_q, gamma_k, scale)      in place on the packed qkv [N, 3, H, 96]: q and k
                                                          rotated, then RMS-normalised and scaled
 
-Every value is rounded to fp16 where the eager chain rounds it (by inline PTX: Triton folds a plain round trip) (after LayerNorm32, after the modulation's product
-and sum, after the rotation, after the RMS norm), and the rotation multiplies as PyTorch's complex product does, so
-only the two reductions (LayerNorm's mean and variance, the norm of q / k) are summed in another order: a change of
-rounding, which the samplers amplify into a different sample of the same quality - judged end to end before the
-switch is turned on. ``check`` runs both kernels once against the eager ops on a small table; a card or a Triton
-that cannot run them turns the switch off with a warning.
+Every value is rounded to fp16 where the eager chain rounds it (after LayerNorm32, after the modulation's product
+and sum, after the rotation, after the RMS norm; by inline PTX, since Triton folds a plain round trip away), and the
+rotation multiplies as PyTorch's complex product does, so only the two reductions (LayerNorm's mean and variance,
+the norm of q / k) are summed in another order: a change of rounding, which the samplers amplify into a different
+sample of the same quality - judged end to end before the switch is turned on. ``check`` runs every variant the blocks use once against the eager ops on a small table; a card
+or a Triton that cannot run them turns the switch off with a warning.
 """
 
 from __future__ import annotations
@@ -142,7 +142,9 @@ def usable(x: torch.Tensor) -> bool:
 
 
 def check(device: torch.device) -> tuple[bool, str]:
-    """Both kernels once on a random table against the eager ops: within one fp16 rounding step of them."""
+    """Every kernel variant the blocks run, once on a random table against the eager ops: within two fp16
+    rounding steps of them (``_close``). norm_modulate without the affine and with the modulation (norm1, norm3), with the
+    affine and without the modulation (norm2); rope_rms_ with q's and k's own gains."""
     try:
         import torch.nn.functional as F
 
@@ -150,24 +152,31 @@ def check(device: torch.device) -> tuple[bool, str]:
         x = torch.randn((37, 2112), device=device, dtype=torch.float16, generator=g)
         s1 = (1 + 0.1 * torch.randn((2112,), device=device, generator=g)).half()
         sh = (0.1 * torch.randn((2112,), device=device, generator=g)).half()
+        w = 1 + 0.1 * torch.randn((2112,), device=device, generator=g)
+        b = 0.1 * torch.randn((2112,), device=device, generator=g)
         want = (F.layer_norm(x.float(), (2112,), eps=1e-6).half() * s1) + sh
         got = norm_modulate(x, 1e-6, scale1=s1, shift=sh)
         if not _close(got, want):
-            return False, "norm_modulate differs from the eager ops by more than one rounding"
+            return False, "norm_modulate (modulated) differs from the eager ops by more than two rounding steps"
+        want = F.layer_norm(x.float(), (2112,), w, b, eps=1e-6).half()
+        got = norm_modulate(x, 1e-6, weight=w, bias=b)
+        if not _close(got, want):
+            return False, "norm_modulate (affine) differs from the eager ops by more than two rounding steps"
         qkv = torch.randn((37, 3, 2, 96), device=device, dtype=torch.float16, generator=g)
         ang = torch.rand((37, 48), device=device, generator=g) * 6.28
         phases = torch.polar(torch.ones_like(ang), ang)
-        gam = 1 + 0.1 * torch.randn((2, 96), device=device, generator=g)
+        gam_q = 1 + 0.1 * torch.randn((2, 96), device=device, generator=g)
+        gam_k = 1 + 0.1 * torch.randn((2, 96), device=device, generator=g)
         q, k, v = qkv.unbind(1)
         rot = []
         for t in (q, k):
             c = torch.view_as_complex(t.float().reshape(37, 2, 48, 2)) * phases[:, None]
             rot.append(torch.view_as_real(c).reshape(37, 2, 96).half())
-        want_q = (F.normalize(rot[0].float(), dim=-1) * gam * 96 ** 0.5).half()
-        want_k = (F.normalize(rot[1].float(), dim=-1) * gam * 96 ** 0.5).half()
-        got = rope_rms_(qkv.clone(), phases, gam, gam, 96 ** 0.5)
+        want_q = (F.normalize(rot[0].float(), dim=-1) * gam_q * 96 ** 0.5).half()
+        want_k = (F.normalize(rot[1].float(), dim=-1) * gam_k * 96 ** 0.5).half()
+        got = rope_rms_(qkv.clone(), phases, gam_q, gam_k, 96 ** 0.5)
         if not (_close(got[:, 0], want_q) and _close(got[:, 1], want_k) and torch.equal(got[:, 2], v)):
-            return False, "rope_rms_ differs from the eager ops by more than one rounding"
+            return False, "rope_rms_ differs from the eager ops by more than two rounding steps"
         torch.cuda.synchronize(device)
     except Exception as exc:  # noqa: BLE001 - whatever Triton or the card raise: the eager ops serve
         return False, f"{type(exc).__name__}: {str(exc)[:300]}"
