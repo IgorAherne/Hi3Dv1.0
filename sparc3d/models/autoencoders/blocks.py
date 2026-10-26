@@ -6,10 +6,13 @@ Module and parameter names are load-bearing: they define the checkpoint key layo
 # Adapted from Pointcept / Point Transformer V3 (Xiaoyang Wu et al.) under the
 # MIT License. Modified for SPARC3D: specialized for the sparse mesh
 # autoencoder, with the training paths and drop-path removed.
-# Modified for Spellcast3D: PyTorch's attention where flash-attn is missing or the card predates sm_80.
+# Modified for Spellcast3D: PyTorch's attention where flash-attn is missing or the card predates sm_80; an
+# opt-in GroupNorm whose moments are summed in float64 in a canonical order (exact_group_norm), for the
+# slab-streamed decode.
 
 from __future__ import annotations
 
+import contextlib
 import warnings
 
 import torch
@@ -36,6 +39,59 @@ when a *completed* decode is too large to feed another pass."""
 _GROUP_NORM_SPLIT = 8
 """Groups normalized per iteration. Group statistics are independent, so this only
 bounds the temporaries, not the result."""
+
+MOMENT_CHUNK_ROWS = 1 << 15
+"""Rows per float64 partial sum in :func:`moment_sums`."""
+
+_exact_moments = False
+
+
+@contextlib.contextmanager
+def exact_group_norm():
+    """Inside the block, PointGroupNorm sums its moments in float64, in one canonical order.
+
+    The default float32 ``scatter_add`` runs as atomics in no fixed order, so its sums vary
+    in the last bits from run to run. Here the points are taken in (x, y, z) order and summed
+    :data:`MOMENT_CHUNK_ROWS` at a time (:func:`moment_sums`), so the result is the same for
+    any order of the rows: the slab-streamed decode sums the same chunks.
+    """
+    global _exact_moments
+    previous, _exact_moments = _exact_moments, True
+    try:
+        yield
+    finally:
+        _exact_moments = previous
+
+
+def moment_chunk_sums(chunk: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-channel float64 sums of one chunk of rows and of their float32 squares ``[C]``."""
+    chunk = chunk.float()
+    return chunk.double().sum(dim=0), chunk.square().double().sum(dim=0)
+
+
+def moment_sums(feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-channel float64 sums of ``feat`` and of its float32 square: chunk by chunk, in row order."""
+    sums = torch.zeros(feat.shape[1], dtype=torch.float64, device=feat.device)
+    sums_sq = torch.zeros_like(sums)
+    for start in range(0, feat.shape[0], MOMENT_CHUNK_ROWS):
+        chunk_sums, chunk_sums_sq = moment_chunk_sums(feat[start:start + MOMENT_CHUNK_ROWS])
+        sums += chunk_sums
+        sums_sq += chunk_sums_sq
+    return sums, sums_sq
+
+
+def canonical_order(point: Point) -> torch.Tensor:
+    """Row order of ``point`` by (x, y, z) grid coordinate."""
+    if "sparse_conv_feat" in point:
+        coords = point.sparse_conv_feat.indices[:, 1:].long()
+    else:
+        coords = point.grid_coord.long()
+    return torch.argsort((coords[:, 0] << 42) | (coords[:, 1] << 21) | coords[:, 2])
+
+
+def group_sums(channel_sums: torch.Tensor, groups: int) -> torch.Tensor:
+    """Per-channel float64 sums gathered into ``[1, groups]`` float32 group sums."""
+    return channel_sums.view(groups, -1).sum(dim=1).float().view(1, groups)
 
 
 class Swish(nn.Module):
@@ -97,19 +153,28 @@ class PointGroupNorm(PointModule):
         feat_group = feat.view(N, G, CP)
         feat_norm_all = feat.new_zeros((N, G, CP))
 
+        exact = _exact_moments and B == 1
+        if exact:
+            exact_sums, exact_sums_sq = (group_sums(s, G) for s in moment_sums(feat[canonical_order(point)]))
+
         for start in range(0, G, _GROUP_NORM_SPLIT):
             end = min(start + _GROUP_NORM_SPLIT, G)
 
             feat_slice = feat_group[:, start:end, :]
-            sum_feat = feat_slice.sum(dim=2)
-            sum_feat_sq = feat_slice.square().sum(dim=2)
+            if exact:
+                sums = exact_sums[:, start:end].clone()
+                sums_sq = exact_sums_sq[:, start:end].clone()
+            else:
+                sum_feat = feat_slice.sum(dim=2)
+                sum_feat_sq = feat_slice.square().sum(dim=2)
 
-            # Per-(batch, group) moments, accumulated over the points of each element.
-            batch_idx = batch.view(-1, 1).expand(-1, end - start).long()
-            sums = feat.new_zeros((B, end - start)).scatter_add(0, batch_idx, sum_feat)
-            sums_sq = feat.new_zeros((B, end - start)).scatter_add(
-                0, batch_idx, sum_feat_sq
-            )
+                # Per-(batch, group) moments, accumulated over the points of each element.
+                batch_idx = batch.view(-1, 1).expand(-1, end - start).long()
+                sums = feat.new_zeros((B, end - start)).scatter_add(0, batch_idx, sum_feat)
+                sums_sq = feat.new_zeros((B, end - start)).scatter_add(
+                    0, batch_idx, sum_feat_sq
+                )
+                del sum_feat, sum_feat_sq
 
             counts = torch.bincount(batch, minlength=B).float().view(B, 1) * CP
             mean = sums.div_(counts + self.eps)
@@ -120,7 +185,7 @@ class PointGroupNorm(PointModule):
             inv_std_exp = inv_std.index_select(0, batch).unsqueeze(2)
             feat_norm_all[:, start:end, :] = feat_slice.sub(mean_exp).mul_(inv_std_exp)
 
-            del feat_slice, sum_feat, sum_feat_sq, sums, sums_sq
+            del feat_slice, sums, sums_sq
             del mean, var, inv_std, mean_exp, inv_std_exp
 
         feat_norm_all = feat_norm_all.view(N, C)
