@@ -294,12 +294,14 @@ def fill_mesh_holes_lean(vertices: torch.Tensor, faces: torch.Tensor, length_thr
         del hit
     boundary = torch.cat(boundary)
 
-    loops = _boundary_loops(boundary.cpu().numpy().astype(int))
-    new_faces = [_ear_clip(vertices, loop) for loop in loops if 3 <= len(loop) <= length_thresh]
-    if new_faces:
-        appended = torch.from_numpy(np.vstack(new_faces)).long().to(vertices.device)
-        faces = torch.cat([faces, appended], dim=0)
-    return faces
+    loops = [loop for loop in _boundary_loops(boundary.cpu().numpy().astype(int)) if 3 <= len(loop) <= length_thresh]
+    if not loops:
+        return faces
+    points = vertices.cpu()           # one copy for every loop: _ear_clip then picks its points on the host
+    new_faces = [_ear_clip(points, loop) for loop in loops]
+    del points
+    appended = torch.from_numpy(np.vstack(new_faces)).long().to(vertices.device)
+    return torch.cat([faces, appended], dim=0)
 
 
 def _mark(trace: list | None, what: str, device: torch.device) -> None:
