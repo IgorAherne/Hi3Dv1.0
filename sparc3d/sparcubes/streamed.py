@@ -2,15 +2,15 @@
 
 Spellcast3D addition (not part of Hi3D v1.0).
 
-:func:`point_to_mesh` + :func:`fill_mesh_holes` over slabs of whole x layers. A slab reads its own
-cube layers ``[x0, x1)`` plus three layers below and two above, which is what makes every corner
-average, sign, ambiguity resolution and dual vertex it keeps the same as over the whole field. It
-keeps the dual vertices of its own cubes and the quads of the surface edges whose lowest x lies in
-the slab. The pieces are put in the reference's order by keys (dual vertices by (vertex count of the
-cube, cube, index in the cube); quads flipped first, then by their edge's corner indices), so the
-mesh is the reference's, vertex for vertex and face for face (bit for bit under PyTorch's deterministic
-algorithms; by default the corner and dual-vertex sums of both are float32 atomics, whose last bit
-varies from run to run).
+:func:`point_to_mesh` + :func:`fill_mesh_holes` piece by piece (the decode's pieces: runs of whole x
+layers, a big layer in strips of y lines). A piece reads its own cubes plus three cells below and two
+above in x (and in y when cut in y), which is what makes every corner average, sign, ambiguity
+resolution and dual vertex it keeps the same as over the whole field. It keeps the dual vertices of
+its own cubes and the quads of the surface edges whose lowest corner lies in the piece. The pieces
+are put in the reference's order by keys (dual vertices by (vertex count of the cube, cube, index in
+the cube); quads flipped first, then by their edge's corner indices), so the mesh is the reference's,
+vertex for vertex and face for face (bit for bit under PyTorch's deterministic algorithms; by default
+the corner and dual-vertex sums of both are float32 atomics, whose last bit varies from run to run).
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from sparc3d.structures.point import Point
 
 HALO_BELOW = 3
 HALO_ABOVE = 2
-"""Cube layers a slab reads beyond its own (see the module docstring)."""
+"""Cells a piece reads beyond its own, in x and (when cut) in y (see the module docstring)."""
 
 _QUAD_SPLIT = (0, 1, 3, 3, 1, 2)
 """FlexiCubes' fixed quad diagonal (``quad_split_2``)."""
@@ -48,9 +48,11 @@ def _voxel_grid(coords: torch.Tensor, resolution: int) -> tuple[torch.Tensor, to
 
 
 def _slab_pieces(rows: torch.Tensor, grid: torch.Tensor, resolution: int, matrix: torch.Tensor,
-                 x0: int, x1: int) -> tuple | None:
-    """point_to_mesh over one slab's rows (already in (x, y, z) order); the slab's own dual vertices
-    and quads with their ordering keys, or None when it holds no surface."""
+                 box: tuple[int, int, int, int]) -> tuple | None:
+    """point_to_mesh over one piece's window rows (in (x, y, z) order); the dual vertices of the cubes
+    in ``box`` = (x0, x1, y0, y1) and the quads of the edges whose lowest corner lies in it, with their
+    ordering keys, or None when it holds no surface."""
+    x0, x1, y0, y1 = box
     fc = _extractor(rows.device)
     feat = rows[:, 8:]
     sdf = feat[:, 0:8].reshape(-1, 8, 1)
@@ -92,7 +94,9 @@ def _slab_pieces(rows: torch.Tensor, grid: torch.Tensor, resolution: int, matrix
         vd_cube.append(cube)
         vd_key.append(((num - 1) * cube_space + cube_key[cube]) * 4 + j)
     vd_cube, vd_key = torch.cat(vd_cube), torch.cat(vd_key)
-    own_vd = (grid[surf_index[vd_cube], 0] >= x0) & (grid[surf_index[vd_cube], 0] < x1)
+    cube = grid[surf_index[vd_cube]]
+    own_vd = (cube[:, 0] >= x0) & (cube[:, 0] < x1) & (cube[:, 1] >= y0) & (cube[:, 1] < y1)
+    del cube
 
     # Quads as _triangulate builds them, with the edge each comes from.
     group_mask = (edge_counts == 4) & surf_edges_mask
@@ -105,8 +109,9 @@ def _slab_pieces(rows: torch.Tensor, grid: torch.Tensor, resolution: int, matrix
     s_edges = sdf[ends.reshape(-1)].reshape(-1, 2)
     flip = s_edges[:, 0] > 0
     p0, p1 = vert_coord[ends[:, 0]], vert_coord[ends[:, 1]]
-    low = torch.minimum(p0[:, 0], p1[:, 0])
-    own_quad = (low >= x0) & (low < x1)
+    low = torch.minimum(p0, p1)
+    own_quad = (low[:, 0] >= x0) & (low[:, 0] < x1) & (low[:, 1] >= y0) & (low[:, 1] < y1)
+    del low
     step = p1 - p0
     direction = torch.where(step[:, 0] != 0, 2, torch.where(step[:, 2] != 0, 1, 0))
     corner_space = (resolution + 1) ** 3
@@ -118,33 +123,33 @@ def _slab_pieces(rows: torch.Tensor, grid: torch.Tensor, resolution: int, matrix
 
 def extract_streamed(field, max_rows: int = 1 << 20, length_thresh: int = 10000,
                      trace: list | None = None, release: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
-    """The reference ``fill_mesh_holes(point_to_mesh(decoded))``, slab by slab.
+    """The reference ``fill_mesh_holes(point_to_mesh(decoded))``, piece by piece.
 
     Args:
         field: A :class:`~sparc3d.models.autoencoders.streamed.DecodedField`.
-        max_rows: Decoded rows per slab, halo layers included.
+        max_rows: Decoded rows per piece, halo included.
         length_thresh: Longest boundary loop filled, as in :func:`fill_mesh_holes`.
         trace: When given, per-phase card peaks are appended to it.
-        release: Free the field's rows once every slab is read (before the merge and hole filling).
+        release: Free the field's rows once every piece is read (before the merge and hole filling).
 
     Returns:
         ``(vertices [V, 3] float32, faces [F, 3])`` on the card, in the decode's unit frame.
     """
-    from sparc3d.models.autoencoders.streamed import plan_slabs, prefetched
+    from sparc3d.models.autoencoders.streamed import plan_pieces, prefetched, take
 
     level, store, matrix = field.level, field.store, field.matrix
     resolution = level.resolution
-    slabs = plan_slabs(level, max_rows, halo=HALO_BELOW)
+    pieces = plan_pieces(level, max_rows, HALO_BELOW, HALO_ABOVE)
     vds, vd_keys, quad_keys, face_keys = [], [], [], []
     with torch.inference_mode():
-        for (x0, x1), fetched in prefetched(
-                slabs, lambda s: store.fetch(*level.rows(s[0] - HALO_BELOW, s[1] + HALO_ABOVE))):
-            r0, r1 = level.rows(x0 - HALO_BELOW, x1 + HALO_ABOVE)
-            pieces = _slab_pieces(fetched.get(), level.coords[r0:r1].long(), resolution, matrix, x0, x1)
-            if pieces is not None:
-                for out, piece in zip((vds, vd_keys, quad_keys, face_keys), pieces):
-                    out.append(piece)
-            del pieces, fetched
+        for piece, fetched in prefetched(
+                pieces, lambda p: store.fetch(level.ranges(p.window(HALO_BELOW, HALO_ABOVE)))):
+            window = level.ranges(piece.window(HALO_BELOW, HALO_ABOVE))
+            kept = _slab_pieces(fetched.get(), take(level.coords, window).long(), resolution, matrix, piece.box)
+            if kept is not None:
+                for out, part in zip((vds, vd_keys, quad_keys, face_keys), kept):
+                    out.append(part)
+            del kept, fetched
         if release:
             field.free()
         _mark(trace, "extract_slabs")
