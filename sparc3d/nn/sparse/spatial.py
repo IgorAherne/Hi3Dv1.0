@@ -2,6 +2,8 @@
 
 # Adapted from Microsoft TRELLIS under the MIT License.
 # Modified for SPARC3D to retain only paired downsample and upsample operations.
+# Modified for Spellcast3D: the downsample's mapping kept in the spatial cache (the coordinates of a pass are
+# fixed), the upsample without re-checking the layout it recorded.
 
 from __future__ import annotations
 
@@ -9,6 +11,8 @@ from collections.abc import Sequence
 
 import torch
 from torch import nn
+
+from sparc3d.nn import accel
 
 from .basic import SparseTensor
 
@@ -35,6 +39,82 @@ class SparseDownsample(nn.Module):
         """Downsample ``input`` and register the inverse mapping."""
         dimensions = input.coords.shape[-1] - 1
         factor = _factor_tuple(self.factor, dimensions)
+        key = f"downsample_{factor}"
+        mapping = input.get_spatial_cache(key) if accel.on("downsample") else None
+        if mapping is None:
+            new_coords, inverse, layout = self._mapping(input, factor, dimensions)
+        else:
+            new_coords, inverse, layout = mapping
+        if accel.ENABLED and accel.DETERMINISTIC:
+            new_feats = self._serial_mean(input, inverse, new_coords.shape[0], factor)
+        else:
+            new_feats = torch.scatter_reduce(
+                torch.zeros(
+                    new_coords.shape[0],
+                    input.feats.shape[1],
+                    device=input.device,
+                    dtype=input.dtype,
+                ),
+                dim=0,
+                index=inverse[:, None].expand(-1, input.feats.shape[1]),
+                src=input.feats,
+                reduce="mean",
+            )
+        output = SparseTensor(
+            new_feats,
+            new_coords,
+            shape=input.shape,
+            layout=layout,
+            scale=tuple(scale * value for scale, value in zip(input.scale, factor)),
+            spatial_cache=input._spatial_cache,
+            trusted=layout is not None,
+        )
+        if accel.on("downsample") and mapping is None:
+            input.register_spatial_cache(key, (new_coords, inverse, output.layout))
+        output.register_spatial_cache(f"upsample_{factor}_coords", input.coords)
+        output.register_spatial_cache(f"upsample_{factor}_layout", input.layout)
+        output.register_spatial_cache(f"upsample_{factor}_idx", inverse)
+        return output
+
+    @staticmethod
+    def _serial_mean(
+        input: SparseTensor, inverse: torch.Tensor, outputs: int, factor: tuple[int, ...]
+    ) -> torch.Tensor:
+        """``scatter_reduce(zeros, inverse, feats, "mean")`` with its sums in one fixed order.
+
+        The CUDA scatter adds each row into its output with atomics, in whatever order the
+        threads arrive, rounding after each add (fp16 here): its last bits change from run
+        to run. This adds each output's rows in the order of the input rows, rounding after
+        each add as a serial scatter does, then divides by the count plus one (the mean
+        counts the zero it starts from): one of the original's own results, every time.
+        """
+        key = f"downsample_slots_{factor}"
+        slots = input.get_spatial_cache(key)
+        if slots is None:
+            rows = inverse.shape[0]
+            order = torch.argsort(inverse, stable=True)
+            grouped = inverse[order]
+            counts = torch.bincount(inverse, minlength=outputs)
+            starts = torch.cumsum(counts, 0) - counts
+            rank = torch.arange(rows, device=inverse.device) - starts[grouped]
+            width = int(counts.max()) if rows else 1
+            slots = torch.full((outputs, width), rows, dtype=torch.long, device=inverse.device)
+            slots[grouped, rank] = order
+            divisor = (counts + 1).to(input.dtype)[:, None]
+            slots = (slots, divisor)
+            input.register_spatial_cache(key, slots)
+        slots, divisor = slots
+        padded = torch.cat((input.feats, input.feats.new_zeros((1, input.feats.shape[1]))))
+        total = padded[slots[:, 0]] + 0.0      # from +0, as the scatter starts: -0 + 0 is +0
+        for column in range(1, slots.shape[1]):
+            total = total + padded[slots[:, column]]
+        return total / divisor
+
+    @staticmethod
+    def _mapping(
+        input: SparseTensor, factor: tuple[int, ...], dimensions: int
+    ) -> tuple[torch.Tensor, torch.Tensor, list[slice] | None]:
+        """Downsampled coordinates, each input row's output row, and (unknown yet) the layout."""
         coordinate_columns = list(input.coords.unbind(dim=-1))
         for axis, value in enumerate(factor):
             coordinate_columns[axis + 1] = coordinate_columns[axis + 1] // value
@@ -49,18 +129,6 @@ class SparseDownsample(nn.Module):
             for coordinate, offset in zip(coordinate_columns, offsets)
         )
         unique_codes, inverse = codes.unique(return_inverse=True)
-        new_feats = torch.scatter_reduce(
-            torch.zeros(
-                unique_codes.shape[0],
-                input.feats.shape[1],
-                device=input.device,
-                dtype=input.dtype,
-            ),
-            dim=0,
-            index=inverse[:, None].expand(-1, input.feats.shape[1]),
-            src=input.feats,
-            reduce="mean",
-        )
         new_coords = torch.stack(
             [unique_codes // offsets[0]]
             + [
@@ -69,17 +137,7 @@ class SparseDownsample(nn.Module):
             ],
             dim=-1,
         )
-        output = SparseTensor(
-            new_feats,
-            new_coords,
-            shape=input.shape,
-            scale=tuple(scale * value for scale, value in zip(input.scale, factor)),
-            spatial_cache=input._spatial_cache,
-        )
-        output.register_spatial_cache(f"upsample_{factor}_coords", input.coords)
-        output.register_spatial_cache(f"upsample_{factor}_layout", input.layout)
-        output.register_spatial_cache(f"upsample_{factor}_idx", inverse)
-        return output
+        return new_coords, inverse, None
 
 
 class SparseUpsample(nn.Module):
@@ -100,6 +158,21 @@ class SparseUpsample(nn.Module):
             ValueError: ``input`` is not at a scale this factor could have produced,
                 or no paired :class:`SparseDownsample` registered a cache for it.
         """
+        coords, layout, inverse, scale = self.mapping(input)
+        return SparseTensor(
+            input.feats[inverse],
+            coords,
+            shape=input.shape,
+            layout=layout,
+            scale=scale,
+            spatial_cache=input._spatial_cache,
+            trusted=True,
+        )
+
+    def mapping(
+        self, input: SparseTensor
+    ) -> tuple[torch.Tensor, list[slice], torch.Tensor, tuple[int, ...]]:
+        """The upsampled coordinates, their layout, each output row's input row, and the scale."""
         dimensions = input.coords.shape[-1] - 1
         factor = _factor_tuple(self.factor, dimensions)
         if any(scale % value for scale, value in zip(input.scale, factor)):
@@ -115,11 +188,9 @@ class SparseUpsample(nn.Module):
                 "upsample cache not found; SparseUpsample must follow its "
                 "paired SparseDownsample"
             )
-        return SparseTensor(
-            input.feats[inverse],
+        return (
             coords,
-            shape=input.shape,
-            layout=layout,
-            scale=tuple(scale // value for scale, value in zip(input.scale, factor)),
-            spatial_cache=input._spatial_cache,
+            layout,
+            inverse,
+            tuple(scale // value for scale, value in zip(input.scale, factor)),
         )

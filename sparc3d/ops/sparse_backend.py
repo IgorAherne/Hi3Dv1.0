@@ -1,4 +1,8 @@
-"""Sparse-convolution primitives built on spconv."""
+"""Sparse-convolution primitives built on spconv.
+
+Modified for Spellcast3D: a tensor's grid, batch size and index pairs kept for reuse over the same coordinates
+(``geometry_of``, ``sparse_tensor_from``, ``keep_index_pairs``).
+"""
 
 from __future__ import annotations
 
@@ -248,6 +252,39 @@ def sparse_tensor(
         spatial_shape=list(spatial_shape),
         batch_size=int(coords[:, 0].max()) + 1,
     )
+
+
+def geometry_of(tensor: Any) -> dict[str, Any]:
+    """The coordinates-only state of an spconv tensor: grid, batch size, and an index-pair
+    dictionary that ``keep_index_pairs`` fills and ``sparse_tensor_from`` hands to spconv."""
+    return {
+        "spatial_shape": list(tensor.spatial_shape),
+        "batch_size": int(tensor.batch_size),
+        "indice_dict": {},
+    }
+
+
+def sparse_tensor_from(
+    feats: torch.Tensor, coords: torch.Tensor, geometry: dict[str, Any]
+) -> Any:
+    """``sparse_tensor`` over coordinates already checked once (``geometry_of``): no host
+    synchronisation, and the convolutions find the index pairs computed before."""
+    spconv = _spconv()
+    return spconv.SparseConvTensor(
+        features=feats,
+        indices=coords.int().contiguous(),
+        spatial_shape=geometry["spatial_shape"],
+        batch_size=geometry["batch_size"],
+        indice_dict=dict(geometry["indice_dict"]),
+    )
+
+
+def keep_index_pairs(geometry: dict[str, Any], tensor: Any) -> None:
+    """Record the index pairs a convolution left in ``tensor`` for later tensors over the
+    same coordinates (submanifold pairs only: their output coordinates are the input's)."""
+    for key, value in tensor.indice_dict.items():
+        if key not in geometry["indice_dict"] and getattr(value, "is_subm", False):
+            geometry["indice_dict"][key] = value
 
 
 def get_feats(tensor: Any) -> torch.Tensor:

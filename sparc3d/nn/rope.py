@@ -2,6 +2,8 @@
 
 # Adapted from Microsoft TRELLIS under the MIT License.
 # Modified for SPARC3D to retain long-grid frequency scaling only.
+# Modified for Spellcast3D: the phases computable once per coordinate set (``phases``) and passed in; the
+# frequencies recomputable after a build on the meta device (``reset_freqs``).
 
 from __future__ import annotations
 
@@ -9,6 +11,8 @@ import math
 
 import torch
 from torch import nn
+
+from sparc3d.nn import accel
 
 
 class RotaryPositionEmbedder(nn.Module):
@@ -31,8 +35,16 @@ class RotaryPositionEmbedder(nn.Module):
         self.hidden_size = hidden_size
         self.in_channels = in_channels
         self.freq_dim = hidden_size // in_channels // 2
+        self.register_buffer("freqs", self._base_freqs(), persistent=False)
+
+    def _base_freqs(self) -> torch.Tensor:
         freqs = torch.arange(self.freq_dim, dtype=torch.float32) / self.freq_dim
-        self.register_buffer("freqs", 1.0 / (10000**freqs), persistent=False)
+        return 1.0 / (10000**freqs)
+
+    def reset_freqs(self) -> None:
+        """Recompute the frequencies (a non-persistent buffer) where the module lives, as at construction."""
+        device = self.freqs.device
+        self.freqs = self._base_freqs().to("cpu" if device.type == "meta" else device)
 
     @staticmethod
     def _update_freqs(
@@ -60,25 +72,15 @@ class RotaryPositionEmbedder(nn.Module):
     @staticmethod
     def _rotary_embedding(x: torch.Tensor, phases: torch.Tensor) -> torch.Tensor:
         x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-        rotated = x_complex * phases.unsqueeze(1)
+        if accel.on("rope_inplace") and not torch.is_grad_enabled():
+            rotated = x_complex.mul_(phases.unsqueeze(1))     # the same product, in place
+        else:
+            rotated = x_complex * phases.unsqueeze(1)
         return torch.view_as_real(rotated).reshape(*rotated.shape[:-1], -1).to(x.dtype)
 
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Rotate queries and keys at ``indices``.
-
-        Args:
-            q: Queries ending in ``[H, D]``.
-            k: Keys with the same shape as ``q``.
-            indices: Spatial positions ending in three coordinates.
-
-        Returns:
-            Rotated queries and keys.
-        """
+    def phases(self, indices: torch.Tensor) -> torch.Tensor:
+        """The complex rotations for ``indices`` (spatial positions ending in three
+        coordinates), as ``forward`` applies them; they depend on the positions only."""
         phases = self._get_phases(indices.reshape(-1)).reshape(*indices.shape[:-1], -1)
         missing = self.hidden_size // 2 - phases.shape[-1]
         if missing > 0:
@@ -87,6 +89,28 @@ class RotaryPositionEmbedder(nn.Module):
                 torch.zeros(*phases.shape[:-1], missing, device=phases.device),
             )
             phases = torch.cat((phases, padding), dim=-1)
+        return phases
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        indices: torch.Tensor,
+        phases: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotate queries and keys at ``indices``.
+
+        Args:
+            q: Queries ending in ``[H, D]``.
+            k: Keys with the same shape as ``q``.
+            indices: Spatial positions ending in three coordinates.
+            phases: ``phases(indices)``, when already computed.
+
+        Returns:
+            Rotated queries and keys.
+        """
+        if phases is None:
+            phases = self.phases(indices)
         return (
             self._rotary_embedding(q, phases),
             self._rotary_embedding(k, phases),
