@@ -1,13 +1,15 @@
 """One refinement pass's VAE decode and mesh extraction within a memory budget.
 
-Spellcast3D addition (not part of Hi3D v1.0). :func:`decode_and_extract` runs the slab-streamed decode
+Spellcast3D addition (not part of Hi3D v1.0). :func:`decode_and_extract` runs the piece-streamed decode
 (:mod:`sparc3d.models.autoencoders.streamed`) and extraction (:mod:`sparc3d.sparcubes.streamed`):
-the same mesh as ``Sparc3DPipeline._extract_mesh(Sparc3DPipeline._decode_latents(...))``, with the
-card's memory held under ``budget_mib``. :func:`memory_model` says what a decode will need.
+the mesh of ``Sparc3DPipeline._extract_mesh(Sparc3DPipeline._decode_latents(...))`` up to the
+reference's own run-to-run variation (deterministic here), with the card's memory held under
+``budget_mib``.
 """
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 
@@ -26,22 +28,27 @@ ROW_BYTES = {
     "conv_out": {128: 1_500},
     "extract": {40: 2_100},
 }
-"""Card bytes a sweep holds at its peak per row of its widest slab (halo layers included), by sweep and
-input channels: measured on the RTX 3060 (knight, pass 3, 400 000-row slabs), rounded up."""
+"""Card bytes a sweep holds at its peak per row of its widest piece (halo included), by sweep and input
+channels: measured on the RTX 3060 (knight, pass 3, 400 000-row pieces), rounded up."""
 COST_SAFETY = 1.15
 MARGIN_MIB = 600
 """Kept free under the budget: the caching allocator's split blocks (measured up to ~450 MiB above the
 allocated peak) and the moments' temporaries."""
 MIN_SLAB_ROWS = 65_536
-"""Smaller slabs cost more halo and launch overhead than they save."""
+"""Smaller pieces cost more halo and launch overhead than they save."""
 RESERVE_ROWS = 1 << 18
-"""A store goes on the card only if a slab this tall of its sweep still fits beside it."""
+"""A store goes on the card only if a piece this tall of its sweep still fits beside it."""
 PIECE_BYTES = 64
 """Card bytes per decoded point the extraction keeps until its merge (dual vertices and quads, with keys)."""
+LATENT_BYTES = 12 << 10
+"""Card bytes per latent the latent level holds (the reference modules on every latent at once)."""
+TAIL_BYTES = 170 * 77
+"""Card bytes per latent the extraction's merge and hole filling hold (not streamed): 170 per decoded
+point, at most 77 decoded points per latent (68-77 measured)."""
 
 
 def row_bytes(kind: str, channels_in: int) -> int:
-    """Measured card bytes per slab row of a sweep (the next wider measurement when not measured)."""
+    """Measured card bytes per piece row of a sweep (the next wider measurement when not measured)."""
     table = ROW_BYTES[kind]
     wider = [c for c in sorted(table) if c >= channels_in]
     if wider:
@@ -51,11 +58,15 @@ def row_bytes(kind: str, channels_in: int) -> int:
 
 
 class BudgetPlan(SlabPlan):
-    """Slab sizes and store places decided as the decode goes: what is allocated now, plus what the
-    sweep needs per slab row, stays under the budget."""
+    """Piece sizes and store places decided as the decode goes: what is allocated now, plus what the
+    sweep needs per piece row, stays under the budget."""
 
     def __init__(self, budget_mib: float, device: torch.device, margin_mib: float = MARGIN_MIB):
         super().__init__()
+        if torch.device(device).type != "cuda":
+            raise ValueError(f"the streamed decode needs a CUDA device, not {device}")
+        if not math.isfinite(budget_mib) or budget_mib <= 0:
+            raise ValueError(f"the streamed decode needs a finite, positive budget in MiB, not {budget_mib}")
         self.budget = int(budget_mib * MIB)
         self.margin = int(margin_mib * MIB)
         self.device = device
@@ -63,6 +74,18 @@ class BudgetPlan(SlabPlan):
 
     def free_bytes(self) -> int:
         return self.budget - self.margin - torch.cuda.memory_allocated(self.device)
+
+    def check_floor(self, latents: int) -> None:
+        """Fail before any work when the budget cannot hold the decode's parts that are not streamed (the
+        latent level, the extraction's tail) or its smallest pieces, beside what is allocated now."""
+        piece = MIN_SLAB_ROWS * max(max(table.values()) for table in ROW_BYTES.values()) * COST_SAFETY
+        need = max(LATENT_BYTES * latents, TAIL_BYTES * latents, piece)
+        if self.free_bytes() < need:
+            floor = (self.budget - self.free_bytes() + need) / MIB
+            raise torch.OutOfMemoryError(
+                f"out of memory: the streamed decode of {latents:,} latents needs a budget of at least "
+                f"{floor:,.0f} MiB of the card (with {torch.cuda.memory_allocated(self.device) / MIB:,.0f} MiB "
+                f"already allocated), not {self.budget / MIB:,.0f} MiB")
 
     def slab_rows(self, kind: str, index: int, channels_in: int, host_row_bytes: int = 0,
                   reserve_bytes: int = 0) -> int:
@@ -115,13 +138,17 @@ def decode_and_extract(vae, latents_coords: torch.Tensor, latents_feats: torch.T
             synchronized after every sweep and PyTorch's process-wide peak counters are reset).
 
     Returns:
-        :class:`StreamedMesh`; vertices and faces equal those of the reference's ``_extract_mesh``.
+        :class:`StreamedMesh`; vertices and faces those of the reference's ``_extract_mesh`` up to its own
+        run-to-run variation (the same in every run here).
 
     Raises:
+        ValueError: ``device`` is not a CUDA device, or ``budget_mib`` is not a finite positive number.
+        torch.OutOfMemoryError: ``budget_mib`` is below what the decode needs at the least (before any work).
         RuntimeError: The isosurface is empty.
     """
     device = torch.device(device)
     plan = BudgetPlan(budget_mib, device)
+    plan.check_floor(int(latents_coords.shape[0]))
     peaks = CardPeaks(device)
     decoder = StreamedDecoder(vae.decoder, plan, device, trace=trace, peaks=peaks)
     t0 = time.perf_counter()
@@ -152,71 +179,3 @@ def decode_and_extract(vae, latents_coords: torch.Tensor, latents_feats: torch.T
                         seconds={"decode": round(t1 - t0, 3), "extract": round(t2 - t1, 3)},
                         peak_alloc_mib=peak_alloc, peak_reserved_mib=peak_reserved,
                         host_mib=decoder.host_peak / MIB, sweeps=sweeps)
-
-WEIGHTS_MIB = 376
-"""The VAE's float32 weights on the card."""
-POINTS_PER_LATENT = 72
-"""Decoded points per latent (measured 68-77 on the five reference props, every pass)."""
-LATENT_STAGE_KIB = (12.0, 25.6)
-"""The latent level (reference modules, every point at once): KiB per latent allocated / reserved."""
-SMALL_DECODE_MIB = (800, 2.9 / 1024)
-"""PyTorch's reserve when the decode is well under the budget: MiB + MiB per decoded point (cached
-blocks are given back only above 60 % of the budget, so the reserve runs ahead of the allocations)."""
-TAIL_BYTES_PER_POINT = 170
-"""The extraction's merge and hole filling (not slabbed): card bytes per decoded point at their peak
-(1537 MiB allocated with the weights for 7.4 M points)."""
-SECONDS_PER_MPOINT = {"decode": (1.6, 2.1), "extract": (2.1, 3.4)}
-"""RTX 3060, per million decoded points: (spconv path, chunked-GEMM path) / (fewest, most holes)."""
-BUDGET_OVERSHOOT_MIB = 100
-"""PyTorch's reserve went at most this far over the budget (5090 MiB at 5000; the allocated peak stays
-under budget - MARGIN_MIB)."""
-
-
-def memory_model(latents: int, budget_mib: float = 5000, decoded_points: int | None = None) -> dict:
-    """What :func:`decode_and_extract` will need, for planning: card and page-locked MiB, seconds.
-
-    The planner's own decisions at the decoded level (the one that matters), with the measured costs.
-    ``decoded_points`` defaults to ``POINTS_PER_LATENT * latents``.
-
-    Returns:
-        ``card_mib``: PyTorch's reserve at its peak; ``floor_mib``: the smallest budget that works;
-        ``host_mib``: page-locked RAM for the stores that do not fit on the card; ``decode_s`` and
-        ``extract_s``: (low, high) on the RTX 3060.
-    """
-    n3 = int(decoded_points if decoded_points is not None else POINTS_PER_LATENT * latents)
-    mib = 1 / MIB
-    latent_alloc = WEIGHTS_MIB + LATENT_STAGE_KIB[0] * latents / 1024
-    latent_reserved = WEIGHTS_MIB + LATENT_STAGE_KIB[1] * latents / 1024
-    tail = WEIGHTS_MIB + TAIL_BYTES_PER_POINT * n3 * mib
-    reserve = {kind: RESERVE_ROWS * row_bytes(kind, channels) * COST_SAFETY * mib
-               for kind, channels in (("resnet1", 128), ("resnet2", 128), ("conv_out", 128))}
-    # Level 3: coordinates and children map, the parents' output, then two 128-channel float16 stores
-    # (hidden, output) and, at the end, the decoded rows.
-    persistent = WEIGHTS_MIB + n3 * 16 * mib + n3 / 4 * 268 * mib + 32
-    free = budget_mib - MARGIN_MIB - persistent
-    store = n3 * 256 * mib
-    host = 0.0
-    hidden_on_card = free - store >= reserve["resnet1"]
-    if hidden_on_card:
-        free -= store
-    else:
-        host += store
-    out_on_card = free - store >= reserve["resnet2"]
-    if not out_on_card:
-        host += store
-    decoded = n3 * 160 * mib
-    free_end = budget_mib - MARGIN_MIB - WEIGHTS_MIB - n3 * 12 * mib - (store if out_on_card else 0)
-    if free_end - decoded < reserve["conv_out"]:
-        host += decoded
-    floor = max(latent_reserved, tail + 300, persistent + MIN_SLAB_ROWS * row_bytes("resnet1", 128) * 2 * mib)
-    small = SMALL_DECODE_MIB[0] + SMALL_DECODE_MIB[1] * n3
-    large = n3 * 128 * 4 >= 2**31 - 1
-    return {
-        "decoded_points": n3,
-        "card_mib": round(max(latent_reserved, min(budget_mib + BUDGET_OVERSHOOT_MIB, small))),
-        "floor_mib": round(floor),
-        "host_mib": round(host),
-        "latent_stage_mib": (round(latent_alloc), round(latent_reserved)),
-        "decode_s": round(SECONDS_PER_MPOINT["decode"][1 if large else 0] * n3 / 1e6, 1),
-        "extract_s": tuple(round(k * n3 / 1e6, 1) for k in SECONDS_PER_MPOINT["extract"]),
-    }

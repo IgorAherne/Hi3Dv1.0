@@ -1,4 +1,4 @@
-"""Slab-streamed mesh extraction from a decoded field, for cards with little memory.
+"""Piece-streamed mesh extraction from a decoded field, for cards with little memory.
 
 Spellcast3D addition (not part of Hi3D v1.0).
 
@@ -19,6 +19,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from sparc3d.models.autoencoders.streamed import lattice_key, plan_pieces, prefetched, take
 from sparc3d.sparcubes.extract import _extractor
 from sparc3d.sparcubes.fill_hole import _boundary_loops, _ear_clip
 from sparc3d.sparcubes.sparse_cube import CUBE_CORNERS
@@ -32,11 +33,6 @@ _QUAD_SPLIT = (0, 1, 3, 3, 1, 2)
 """FlexiCubes' fixed quad diagonal (``quad_split_2``)."""
 
 
-def _lattice_key(coords: torch.Tensor, size: int) -> torch.Tensor:
-    c = coords.long()
-    return (c[:, 0] * size + c[:, 1]) * size + c[:, 2]
-
-
 def _voxel_grid(coords: torch.Tensor, resolution: int,
                 values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """:func:`sparse_cube2verts`: the sorted cube corners, the cubes' corner indices and the mean of the
@@ -46,7 +42,7 @@ def _voxel_grid(coords: torch.Tensor, resolution: int,
     bits in every run and in every piece holding all of the corner's cubes."""
     size = resolution + 1
     corners = (coords.unsqueeze(1) + CUBE_CORNERS.to(coords).unsqueeze(0)).reshape(-1, 3)
-    keys, order = torch.sort(_lattice_key(corners, size), stable=True)
+    keys, order = torch.sort(lattice_key(corners, size), stable=True)
     del corners
     new = torch.ones_like(keys, dtype=torch.bool)
     new[1:] = keys[1:] != keys[:-1]
@@ -120,7 +116,7 @@ def _dual_vertices(fc, positions: torch.Tensor, surf_edges: torch.Tensor, sdf: t
     return vd, vd_idx_map
 
 
-def _slab_pieces(rows: torch.Tensor, grid: torch.Tensor, resolution: int, matrix: torch.Tensor,
+def _piece_parts(rows: torch.Tensor, grid: torch.Tensor, resolution: int, matrix: torch.Tensor,
                  box: tuple[int, int, int, int]) -> tuple | None:
     """point_to_mesh over one piece's window rows (in (x, y, z) order); the dual vertices of the cubes
     in ``box`` = (x0, x1, y0, y1) and the quads of the edges whose lowest corner lies in it, with their
@@ -155,7 +151,7 @@ def _slab_pieces(rows: torch.Tensor, grid: torch.Tensor, resolution: int, matrix
     # then cube, then index within the cube.
     device = rows.device
     surf_index = torch.nonzero(surf_cubes).squeeze(1)
-    cube_key = _lattice_key(grid[surf_index], resolution)
+    cube_key = lattice_key(grid[surf_index], resolution)
     cube_space = resolution ** 3
     num_vd = torch.index_select(fc.num_vd_table, 0, case_ids)
     vd_cube, vd_key = [], []
@@ -187,7 +183,7 @@ def _slab_pieces(rows: torch.Tensor, grid: torch.Tensor, resolution: int, matrix
     step = p1 - p0
     direction = torch.where(step[:, 0] != 0, 2, torch.where(step[:, 2] != 0, 1, 0))
     corner_space = (resolution + 1) ** 3
-    face_key = (~flip).long() * (3 * corner_space) + _lattice_key(p0, resolution + 1) * 3 + direction
+    face_key = (~flip).long() * (3 * corner_space) + lattice_key(p0, resolution + 1) * 3 + direction
     quad_vd = torch.where(flip.unsqueeze(1), quad_vd[:, [0, 1, 3, 2]], quad_vd[:, [2, 3, 1, 0]])
     quad_keys = vd_key[quad_vd[own_quad]]
     return vd[own_vd], vd_key[own_vd], quad_keys, face_key[own_quad]
@@ -209,8 +205,6 @@ def extract_streamed(field, max_rows: int = 1 << 20, length_thresh: int = 10000,
     Returns:
         ``(vertices [V, 3] float32, faces [F, 3])`` on the card, in the decode's unit frame.
     """
-    from sparc3d.models.autoencoders.streamed import plan_pieces, prefetched, take
-
     level, store, matrix = field.level, field.store, field.matrix
     resolution = level.resolution
     device = level.coords.device
@@ -221,7 +215,7 @@ def extract_streamed(field, max_rows: int = 1 << 20, length_thresh: int = 10000,
         for piece, fetched in prefetched(
                 pieces, lambda p: store.fetch(level.ranges(p.window(HALO_BELOW, HALO_ABOVE)))):
             window = level.ranges(piece.window(HALO_BELOW, HALO_ABOVE))
-            kept = _slab_pieces(fetched.get(), take(level.coords, window).long(), resolution, matrix, piece.box)
+            kept = _piece_parts(fetched.get(), take(level.coords, window).long(), resolution, matrix, piece.box)
             if kept is not None:
                 for out, part in zip((vds, vd_keys, quad_keys, face_keys), kept):
                     out.append(part)
@@ -241,7 +235,7 @@ def extract_streamed(field, max_rows: int = 1 << 20, length_thresh: int = 10000,
         quad_keys = torch.cat(quad_keys)
         quads = torch.searchsorted(vd_keys, quad_keys)
         if not bool((vd_keys[quads.clamp(max=vd_keys.shape[0] - 1)] == quad_keys).all()):
-            raise RuntimeError("a quad refers to a dual vertex no slab kept")
+            raise RuntimeError("a quad refers to a dual vertex no piece kept")
         quads = quads.int()
         del quad_keys, vd_keys
         face_order = torch.argsort(torch.cat(face_keys))

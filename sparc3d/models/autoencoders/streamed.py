@@ -1,4 +1,4 @@
-"""Slab-streamed decode of :class:`PTv3MeshDecoder`, for cards with little memory.
+"""Piece-streamed decode of :class:`PTv3MeshDecoder`, for cards with little memory.
 
 Spellcast3D addition (not part of Hi3D v1.0).
 
@@ -11,10 +11,11 @@ GroupNorm needs, in row order. Between sweeps a level's tensors live on the card
 memory (copied on side streams); an upsampled level's input is not stored but recomputed from its
 parents whenever a sweep needs it.
 
-Every point goes through the reference decoder's own operations in the same dtypes, and comes out
-with the same bits whatever the slabs: spconv's implicit GEMM gives a row the same result in any
-slab, a convolution takes the chunked-GEMM path exactly when the whole level would, and the cuBLAS
-products are padded to heights where their rounding no longer depends on the height. The one
+Every point goes through the reference decoder's own operations in the same dtypes. On one card it
+comes out with the same bits whatever the pieces: spconv's implicit GEMM gives a row the same result
+in any piece, a convolution takes the chunked-GEMM path exactly when the whole level would, and the
+cuBLAS products are padded to heights where their rounding no longer depends on the height (heights
+measured on an RTX 3060; another card's cuBLAS may change kernels at other heights). The one
 deliberate difference: GroupNorm moments are summed in float64 over a canonical split of the level
 (``blocks.exact_group_norm``), where the reference sums float32 atomics in no fixed order.
 """
@@ -225,14 +226,15 @@ class Streams:
     """The side streams page-locked stores copy on, one per direction (reads overlap writes)."""
 
     def __init__(self, device: torch.device):
-        self.cuda = torch.device(device).type == "cuda"
-        self.h2d = torch.cuda.Stream(device) if self.cuda else None
-        self.d2h = torch.cuda.Stream(device) if self.cuda else None
+        self.device = torch.device(device)
+        self.cuda = self.device.type == "cuda"
+        self.h2d = torch.cuda.Stream(self.device) if self.cuda else None
+        self.d2h = torch.cuda.Stream(self.device) if self.cuda else None
 
     def barrier(self) -> None:
         """Later reads and compute see every write queued so far (no host sync)."""
         if self.cuda:
-            torch.cuda.current_stream().wait_stream(self.d2h)
+            torch.cuda.current_stream(self.device).wait_stream(self.d2h)
             self.h2d.wait_stream(self.d2h)
 
 
@@ -245,7 +247,7 @@ class Pending:
 
     def get(self) -> torch.Tensor:
         if self.event is not None:
-            compute = torch.cuda.current_stream()
+            compute = torch.cuda.current_stream(self.parts[0].device)
             compute.wait_event(self.event)
             for part in self.parts:
                 part.record_stream(compute)
@@ -365,7 +367,7 @@ class Store:
             self.data[a:a + len(values)].copy_(values)
             return
         d2h = self.streams.d2h
-        d2h.wait_stream(torch.cuda.current_stream())
+        d2h.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(d2h):
             self.data[a:a + len(values)].copy_(values, non_blocking=True)
         values.record_stream(d2h)
@@ -776,7 +778,6 @@ class StreamedDecoder:
             self.host_bytes += nbytes
             self.host_peak = max(self.host_peak, self.host_bytes)
         store = Store.empty(rows, channels, dtype, on_card, self.streams, self.device)
-        store.name = name
         if store.pageable and not self.pageable_warned:
             self.pageable_warned = True
             print(f"[sparc3d] streamed decode: host memory could not be page-locked ({store.pageable}); "
