@@ -8,7 +8,8 @@ it to 128 (SageAttention's kernels take 64 or 128): q and k quantised to int8 wi
 and log2(e)), the logits from int8 tensor-core products summed exactly in int32, the softmax in exp2, P rounded to
 fp16 and multiplied by v in fp16, each 64-key block's product summed in fp16 and added to an fp32 accumulator
 ("fp16+fp32", as SageAttention's sm_8x kernel; ``pv_f16=False`` sums in fp32). The 96 channels run as a 64- and a
-32-wide piece (Triton's tiles are powers of two).
+32-wide piece (Triton's tiles are powers of two). A block's fp16 sum overflows only past |v| ~ 1000; the knight's
+passes 1 and 3 peak at |v| 61 and 43 (17x and 24x below), their block sums at 281 and 233 (230x below fp16's max).
 
 It changes the numbers (the int8 logits, the fp16 partial sums): a different rounding, judged end to end against
 the samplers' rounding-only control before an engine turns it on. Usable on CUDA cards from sm_80 (Triton's int8
