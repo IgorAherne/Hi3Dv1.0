@@ -1,4 +1,8 @@
-"""Safe local and Hugging Face artifact loading for the public pipeline."""
+"""Safe local and Hugging Face artifact loading for the public pipeline.
+
+Modified for Spellcast3D: load_transformer(..., device=) builds the network without storage and loads the
+checkpoint straight onto that device (the same tensors, without ~10 GB of host memory for a float32 copy).
+"""
 
 from __future__ import annotations
 
@@ -191,15 +195,20 @@ def load_conditioner(
     )
 
 
-def load_transformer(root: Path, artifact_name: str) -> Any:
+def load_transformer(root: Path, artifact_name: str, device: Any = None) -> Any:
     """Load one strict mixed-precision transformer artifact on the CPU.
 
     Args:
         root: Validated artifact repository.
         artifact_name: ``"transformer_512"`` or ``"transformer_1024"``.
+        device: Load onto this device instead: the network is built on the meta
+            device (no float32 initialisation on the host, which peaks near 10 GB),
+            given storage on ``device`` in the dtypes the construction ends with, the
+            checkpoint copied in as below and the rotary frequencies (buffers the
+            checkpoint does not hold) recomputed - the same tensors, bit for bit.
 
     Returns:
-        Transformer in evaluation mode on the CPU.
+        Transformer in evaluation mode on the CPU (or ``device``).
 
     Raises:
         ValueError: ``artifact_name`` is not allowlisted.
@@ -215,6 +224,20 @@ def load_transformer(root: Path, artifact_name: str) -> Any:
 
     artifact = root / artifact_name
     config = Sparc3DTransformerConfig.from_dict(_read_json(artifact / "config.json"))
+    if device is not None:
+        import torch
+        from sparc3d.nn.rope import RotaryPositionEmbedder
+
+        with torch.device("meta"):
+            model = Sparc3DTransformer(config)
+        model = model.to_empty(device=device)
+        model.load_state_dict(
+            load_file(str(artifact / "model.safetensors"), device=str(device)), strict=True
+        )
+        for module in model.modules():
+            if isinstance(module, RotaryPositionEmbedder):
+                module.reset_freqs()
+        return model.eval()
     model = Sparc3DTransformer(config)
     model.load_state_dict(
         load_file(str(artifact / "model.safetensors"), device="cpu"), strict=True

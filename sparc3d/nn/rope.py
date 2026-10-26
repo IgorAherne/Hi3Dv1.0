@@ -2,7 +2,8 @@
 
 # Adapted from Microsoft TRELLIS under the MIT License.
 # Modified for SPARC3D to retain long-grid frequency scaling only.
-# Modified for Spellcast3D: the phases computable once per coordinate set (``phases``) and passed in.
+# Modified for Spellcast3D: the phases computable once per coordinate set (``phases``) and passed in; the
+# frequencies recomputable after a build on the meta device (``reset_freqs``).
 
 from __future__ import annotations
 
@@ -34,8 +35,16 @@ class RotaryPositionEmbedder(nn.Module):
         self.hidden_size = hidden_size
         self.in_channels = in_channels
         self.freq_dim = hidden_size // in_channels // 2
+        self.register_buffer("freqs", self._base_freqs(), persistent=False)
+
+    def _base_freqs(self) -> torch.Tensor:
         freqs = torch.arange(self.freq_dim, dtype=torch.float32) / self.freq_dim
-        self.register_buffer("freqs", 1.0 / (10000**freqs), persistent=False)
+        return 1.0 / (10000**freqs)
+
+    def reset_freqs(self) -> None:
+        """Recompute the frequencies (a non-persistent buffer) where the module lives, as at construction."""
+        device = self.freqs.device
+        self.freqs = self._base_freqs().to("cpu" if device.type == "meta" else device)
 
     @staticmethod
     def _update_freqs(
