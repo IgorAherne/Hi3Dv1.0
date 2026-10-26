@@ -80,7 +80,7 @@ class StreamedMesh:
     vertices: torch.Tensor
     """``[V, 3]`` float32, in the decode's unit frame (as the reference's ``_extract_mesh``)."""
     faces: torch.Tensor
-    """``[F, 3]`` int64."""
+    """``[F, 3]`` int64 (the reference's own faces are int32 unless holes were filled; its trimesh is int64)."""
     decoded_points: int
     seconds: dict = field(default_factory=dict)
     peak_alloc_mib: float = 0.0
@@ -127,6 +127,7 @@ def decode_and_extract(vae, latents_coords: torch.Tensor, latents_feats: torch.T
         vertices, faces = extract_streamed(field_, max_rows=rows, trace=trace, release=True)
         if vertices.shape[0] == 0 or faces.shape[0] == 0:
             raise RuntimeError("mesh extraction produced an empty isosurface")
+        faces = faces.long()
         if to_cpu:
             vertices, faces = vertices.cpu(), faces.cpu()
     torch.cuda.synchronize(device)
@@ -150,8 +151,9 @@ LATENT_STAGE_KIB = (12.0, 25.6)
 SMALL_DECODE_MIB = (800, 2.9 / 1024)
 """PyTorch's reserve when the decode is well under the budget: MiB + MiB per decoded point (cached
 blocks are given back only above 60 % of the budget, so the reserve runs ahead of the allocations)."""
-TAIL_BYTES_PER_POINT = 330
-"""The extraction's merge and hole filling (not slabbed): card bytes per decoded point at their peak."""
+TAIL_BYTES_PER_POINT = 170
+"""The extraction's merge and hole filling (not slabbed): card bytes per decoded point at their peak
+(1537 MiB allocated with the weights for 7.4 M points)."""
 SECONDS_PER_MPOINT = {"decode": (1.6, 2.1), "extract": (2.1, 3.4)}
 """RTX 3060, per million decoded points: (spconv path, chunked-GEMM path) / (fewest, most holes)."""
 BUDGET_OVERSHOOT_MIB = 100
