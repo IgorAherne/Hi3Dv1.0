@@ -157,7 +157,9 @@ class SparseMultiHeadAttention(nn.Module):
         return phases
 
     def _zero_key(self, x: SparseTensor) -> tuple:
-        return (x.feats.shape[0], x.feats.dtype, x.device, id(self.to_kv), id(self.to_out))
+        # The projections themselves, not their ids: a layer replaced later (an int8 conversion) is a new key,
+        # and the key keeps the old one alive, so its id cannot come back for another layer.
+        return (x.feats.shape[0], x.feats.dtype, x.device, self.to_kv, self.to_out)
 
     def zero_context_row(self, x: SparseTensor) -> torch.Tensor | None:
         """The output row ``zero_context`` found for ``x``'s token count, or None yet."""
