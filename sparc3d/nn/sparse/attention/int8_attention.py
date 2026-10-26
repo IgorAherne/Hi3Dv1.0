@@ -20,6 +20,8 @@ mma.sync) with Triton installed; ``install`` runs ``self_check`` first and leave
 
 from __future__ import annotations
 
+import warnings
+
 import torch
 
 from ... import accel
@@ -152,7 +154,7 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, pv_f16: bool = 
         q, k, v = q[0], k[0], v[0]
     n, heads, d = q.shape
     kern = _build()
-    km = k.float().mean(dim=0).contiguous()
+    km = k.mean(dim=0, dtype=torch.float32)        # summed in float32 inside the kernel, no float32 copy of k
     qch = kch = None
     if smooth:
         kmax = torch.maximum(k.amax(dim=0).float() - km, km - k.amin(dim=0).float())
@@ -211,7 +213,9 @@ def state() -> dict:
 
 def install(pv_f16: bool = True, device: torch.device | None = None) -> bool:
     """Set ``accel.self_attention`` to this kernel after ``self_check`` on ``device`` (default: the current
-    card); calls it cannot take (``usable``) decline, and the transformer keeps flash-attn / SDPA for them."""
+    card); calls it cannot take (``usable``) decline, and the transformer keeps flash-attn / SDPA for them. A call
+    whose kernel fails (anything but the card's out-of-memory or CUDA errors, which propagate) uninstalls the hook
+    with a warning and declines."""
     if _state["ok"] is None:
         dev = device or torch.device("cuda", torch.cuda.current_device())
         _state["ok"], _state["why"] = self_check(dev)
@@ -221,10 +225,32 @@ def install(pv_f16: bool = True, device: torch.device | None = None) -> bool:
     def run(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor | None:
         if not usable(q):
             return None
-        return attention(q, k, v, pv_f16=pv_f16)
+        try:
+            return attention(q, k, v, pv_f16=pv_f16)
+        except Exception as exc:
+            if _card_failure(exc):
+                raise
+            # the kernel's own failure (a Triton compile or launch limit on a new shape): off for good
+            _state["ok"], _state["why"] = False, f"{type(exc).__name__}: {str(exc)[:300]}"
+            if accel.self_attention is run:
+                accel.self_attention = None
+            warnings.warn(f"the int8 self-attention failed and is off from now on (flash-attn / SDPA run): "
+                          f"{_state['why']}", RuntimeWarning, stacklevel=2)
+            return None
 
     accel.self_attention = run
     return True
+
+
+def _card_failure(exc: BaseException) -> bool:
+    """Whether ``exc`` comes from the card (out of memory, a CUDA error) rather than from the kernel itself."""
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    accelerator_error = getattr(torch, "AcceleratorError", None)
+    if accelerator_error is not None and isinstance(exc, accelerator_error):
+        return True
+    text = str(exc)
+    return "CUDA error" in text or "[CUDA]" in text or "out of memory" in text.lower()
 
 
 def uninstall() -> None:
