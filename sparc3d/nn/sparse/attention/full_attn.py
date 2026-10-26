@@ -2,24 +2,14 @@
 
 # Adapted from Microsoft TRELLIS under the MIT License.
 # Modified for SPARC3D: variable-length flash attention only.
+# Modified for Spellcast3D: PyTorch's attention where flash-attn is missing or the card predates sm_80.
 
 from __future__ import annotations
 
 import torch
 
 from ..basic import SparseTensor
-
-
-def _flash_attn():
-    """Import flash-attn when sparse attention is first executed."""
-    try:
-        import flash_attn
-    except ImportError as exc:
-        raise ImportError(
-            "Sparc3DTransformer attention requires flash-attn; "
-            "install sparc3d[inference]"
-        ) from exc
-    return flash_attn
+from .backend import flash_attn_for, sdpa_spans
 
 
 def _lengths(tensor: SparseTensor) -> list[int]:
@@ -50,10 +40,12 @@ def sparse_scaled_dot_product_attention(
         TypeError: ``query`` is not sparse.
         ValueError: ``kv`` does not share the query's batch size.
     """
-    flash_attn = _flash_attn()
     if not isinstance(query, SparseTensor):
         raise TypeError("Sparc3D sparse attention requires sparse queries")
+    flash_attn = flash_attn_for(query.device)
     query_lengths = _lengths(query)
+    if flash_attn is None:
+        return query.replace(_sdpa(query.feats, kv, query_lengths))
     cumulative_query = _cumulative(query_lengths, query.device)
 
     if kv is None:
@@ -75,3 +67,17 @@ def sparse_scaled_dot_product_attention(
         max(key_lengths),
     )
     return query.replace(output)
+
+
+def _sdpa(feats: torch.Tensor, kv: torch.Tensor | None, query_lengths: list[int]) -> torch.Tensor:
+    cu_q = [0]
+    for length in query_lengths:
+        cu_q.append(cu_q[-1] + length)
+    if kv is None:
+        q, k, v = feats.unbind(dim=1)
+        return sdpa_spans(q, k, v, cu_q, cu_q)
+    batch, length = kv.shape[:2]
+    if batch != len(query_lengths):
+        raise ValueError("query and context batch sizes must match")
+    k, v = kv.reshape(batch * length, *kv.shape[2:]).unbind(dim=1)
+    return sdpa_spans(feats, k, v, cu_q, list(range(0, (batch + 1) * length, length)))

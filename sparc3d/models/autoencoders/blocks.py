@@ -6,6 +6,7 @@ Module and parameter names are load-bearing: they define the checkpoint key layo
 # Adapted from Pointcept / Point Transformer V3 (Xiaoyang Wu et al.) under the
 # MIT License. Modified for SPARC3D: specialized for the sparse mesh
 # autoencoder, with the training paths and drop-path removed.
+# Modified for Spellcast3D: PyTorch's attention where flash-attn is missing or the card predates sm_80.
 
 from __future__ import annotations
 
@@ -14,23 +15,12 @@ import warnings
 import torch
 from torch import nn
 
+from sparc3d.nn.sparse.attention.backend import flash_attn_for, sdpa_spans, sdpa_windows
 from sparc3d.ops import sparse_backend
 from sparc3d.structures.point import Point
 from sparc3d.structures.point_modules import PointModule, PointSequential
 from sparc3d.utils.misc import batch2offset, offset2bincount
 from sparc3d.utils.precision import force_fp32
-
-
-def _flash_attn():
-    """Import flash-attn when serialized attention is first constructed."""
-    try:
-        import flash_attn
-    except ImportError as exc:
-        raise ImportError(
-            "SparconvVAE serialized attention requires flash-attn; "
-            "install sparc3d[inference]"
-        ) from exc
-    return flash_attn
 
 
 _RESNET_SKIP_POINTS = 12_000_000
@@ -340,14 +330,12 @@ class SerializedAttention(PointModule):
 
         Raises:
             ValueError: ``channels`` is not divisible by ``num_heads``.
-            ImportError: flash-attn is not installed.
         """
         super().__init__()
         if channels % num_heads != 0:
             raise ValueError(
                 f"channels {channels} must be divisible by num_heads {num_heads}"
             )
-        self._flash_attn = _flash_attn()
         self.channels = channels
         self.num_heads = num_heads
         self.scale = (channels // num_heads)**-0.5
@@ -430,14 +418,23 @@ class SerializedAttention(PointModule):
 
         qkv = self.qkv(point.feat)[order]
 
-        feat = self._flash_attn.flash_attn_varlen_qkvpacked_func(
-            qkv.half().reshape(-1, 3, H, C // H),
-            cu_seqlens,
-            max_seqlen=self.patch_size,
-            dropout_p=0,
-            softmax_scale=self.scale,
-        ).reshape(-1, C)
-        feat = feat.to(qkv.dtype)[inverse]
+        packed = qkv.half().reshape(-1, 3, H, C // H)
+        flash_attn = flash_attn_for(packed.device)
+        if flash_attn is not None:
+            feat = flash_attn.flash_attn_varlen_qkvpacked_func(
+                packed,
+                cu_seqlens,
+                max_seqlen=self.patch_size,
+                dropout_p=0,
+                softmax_scale=self.scale,
+            )
+        elif packed.shape[0] % self.patch_size == 0 and packed.shape[0] == (len(cu_seqlens) - 1) * self.patch_size:
+            feat = sdpa_windows(packed, self.patch_size, self.scale)
+        else:
+            bounds = cu_seqlens.tolist()
+            q, k, v = packed.unbind(dim=1)
+            feat = sdpa_spans(q, k, v, bounds, bounds, self.scale)
+        feat = feat.reshape(-1, C).to(qkv.dtype)[inverse]
 
         point.feat = self.proj(feat)
         return point
