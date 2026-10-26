@@ -488,6 +488,8 @@ def large_conv(conv, tensor) -> torch.Tensor:
                                            LARGE_MIN_GEMM_ROWS)
 
     def accumulate(source, target, weight):
+        # A submanifold pair map is one to one per offset: index_add_ adds to every target once per
+        # call, so no two atomics meet and the sums keep the loop's order in every run.
         weight_t = weight.T
         for start in range(0, len(source), chunk):
             contribution = tall(lambda x: x @ weight_t, features[source[start:start + chunk]], LARGE_MIN_GEMM_ROWS)

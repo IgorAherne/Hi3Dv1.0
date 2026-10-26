@@ -9,8 +9,9 @@ resolution and dual vertex it keeps the same as over the whole field. It keeps t
 its own cubes and the quads of the surface edges whose lowest corner lies in the piece. The pieces
 are put in the reference's order by keys (dual vertices by (vertex count of the cube, cube, index in
 the cube); quads flipped first, then by their edge's corner indices), so the mesh is the reference's,
-vertex for vertex and face for face (bit for bit under PyTorch's deterministic algorithms; by default
-the corner and dual-vertex sums of both are float32 atomics, whose last bit varies from run to run).
+vertex for vertex and face for face, up to the reference's own run-to-run variation: its corner and
+dual-vertex sums are float32 atomics, whose last bit varies from run to run; here they are taken in a
+fixed order, so the same field gives the same mesh in every run and whatever the pieces.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import torch
 
 from sparc3d.sparcubes.extract import _extractor
 from sparc3d.sparcubes.fill_hole import _boundary_loops, _ear_clip
-from sparc3d.sparcubes.sparse_cube import CUBE_CORNERS, cubes_to_verts
+from sparc3d.sparcubes.sparse_cube import CUBE_CORNERS
 from sparc3d.structures.point import Point
 
 HALO_BELOW = 3
@@ -36,15 +37,87 @@ def _lattice_key(coords: torch.Tensor, size: int) -> torch.Tensor:
     return (c[:, 0] * size + c[:, 1]) * size + c[:, 2]
 
 
-def _voxel_grid(coords: torch.Tensor, resolution: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """:func:`construct_voxel_grid` with one int64 key per corner instead of a row-wise unique: the same
-    sorted corners and the same cube-to-corner indices, in less time and memory."""
+def _voxel_grid(coords: torch.Tensor, resolution: int,
+                values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`sparse_cube2verts`: the sorted cube corners, the cubes' corner indices and the mean of the
+    ``values [V, 8, M]`` the cubes give each corner. One int64 key per corner instead of a row-wise
+    unique (the same corners and indices, in less time and memory), and each corner's sum taken in a
+    fixed order (its cubes in row order, one after the other) instead of float32 atomics, so the same
+    bits in every run and in every piece holding all of the corner's cubes."""
     size = resolution + 1
     corners = (coords.unsqueeze(1) + CUBE_CORNERS.to(coords).unsqueeze(0)).reshape(-1, 3)
-    keys, inverse = torch.unique(_lattice_key(corners, size), return_inverse=True)
+    keys, order = torch.sort(_lattice_key(corners, size), stable=True)
     del corners
+    new = torch.ones_like(keys, dtype=torch.bool)
+    new[1:] = keys[1:] != keys[:-1]
+    first = torch.nonzero(new).squeeze(1)
+    keys = keys[first]
+    vertex = torch.cumsum(new, 0) - 1
+    del new
+    cubes = torch.empty_like(vertex)
+    cubes[order] = vertex
+    del vertex
+    counts = torch.diff(first, append=first.new_tensor([order.shape[0]]))
+    flat = values.reshape(order.shape[0], -1)
+    sums = flat[order[first]]
+    last = order.shape[0] - 1
+    for k in range(1, 8):
+        more = (counts > k).unsqueeze(1)
+        sums = torch.where(more, sums + flat[order[(first + k).clamp_(max=last)]], sums)
+    mean = sums / counts.unsqueeze(1).to(sums.dtype)
     verts = torch.stack([keys // (size * size), (keys // size) % size, keys % size], dim=1)
-    return verts, inverse.reshape(-1, 8)
+    return verts, cubes.view(-1, 8), mean
+
+
+def _dual_vertices(fc, positions: torch.Tensor, surf_edges: torch.Tensor, sdf: torch.Tensor,
+                   case_ids: torch.Tensor, idx_map: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``FlexiCubes._compute_vd``, each dual vertex's edge crossings summed in a fixed order (they are
+    consecutive: added one after the other) instead of float32 atomics."""
+    device = positions.device
+    surf_edges_x = positions[surf_edges.reshape(-1)].reshape(-1, 2, 3)
+    surf_edges_s = sdf[surf_edges.reshape(-1)].reshape(-1, 2, 1)
+    idx_map = idx_map.reshape(-1, 12)
+    num_vd = fc.num_vd_table[case_ids]
+    edge_group, edge_group_to_vd, edge_group_to_cube = [], [], []
+    total = 0
+    group_size = fc.dmc_table.shape[-1]
+    for num in torch.unique(num_vd).tolist():
+        cur_cubes = num_vd == num
+        cube_ids = torch.nonzero(cur_cubes).squeeze(1)
+        curr_num_vd = cube_ids.shape[0] * num
+        curr_edge_group = fc.dmc_table[case_ids[cur_cubes], :num].reshape(-1, num * group_size)
+        curr_edge_group_to_vd = (torch.arange(curr_num_vd, device=device).unsqueeze(-1)
+                                 .repeat(1, group_size) + total).reshape_as(curr_edge_group)
+        total += curr_num_vd
+        curr_edge_group_to_cube = cube_ids.unsqueeze(-1).repeat(1, num * group_size)
+        mask = curr_edge_group != -1
+        edge_group.append(curr_edge_group[mask])
+        edge_group_to_vd.append(curr_edge_group_to_vd[mask])
+        edge_group_to_cube.append(curr_edge_group_to_cube[mask])
+    edge_group = torch.cat(edge_group)
+    edge_group_to_vd = torch.cat(edge_group_to_vd)
+    edge_group_to_cube = torch.cat(edge_group_to_cube)
+
+    index = edge_group_to_cube * 12 + edge_group
+    idx_group = idx_map.reshape(-1)[index]
+    x_group = surf_edges_x[idx_group.reshape(-1)].reshape(-1, 2, 3)
+    s_group = surf_edges_s[idx_group.reshape(-1)].reshape(-1, 2, 1)
+    crossings = fc._linear_interp(s_group.float(), x_group)
+    del x_group, s_group, idx_group
+
+    counts = torch.bincount(edge_group_to_vd, minlength=total)
+    first = torch.cumsum(counts, 0) - counts
+    sums = torch.zeros((total, 3), dtype=torch.float, device=device)
+    last = crossings.shape[0] - 1
+    for k in range(group_size):
+        more = (counts > k).unsqueeze(1)
+        sums = torch.where(more, sums + crossings[(first + k).clamp_(max=last)], sums)
+    vd = sums / counts.unsqueeze(1).float()
+
+    v_idx = torch.arange(total, dtype=torch.int64, device=device)
+    vd_idx_map = torch.zeros((case_ids.shape[0], 12), dtype=torch.int64, device=device)
+    vd_idx_map = vd_idx_map.reshape(-1).scatter(dim=0, index=index, src=v_idx[edge_group_to_vd])
+    return vd, vd_idx_map
 
 
 def _slab_pieces(rows: torch.Tensor, grid: torch.Tensor, resolution: int, matrix: torch.Tensor,
@@ -61,8 +134,7 @@ def _slab_pieces(rows: torch.Tensor, grid: torch.Tensor, resolution: int, matrix
     sdf_sign = torch.sigmoid(rows[:, :8]).unsqueeze(2)
     vert_feat = torch.cat([sdf_sign, vert_feat], dim=2)
     del sdf, deform, sdf_sign
-    vert_coord, cubes = _voxel_grid(grid, resolution)
-    vert_feat = cubes_to_verts(vert_coord.shape[0], cubes, vert_feat)
+    vert_coord, cubes, vert_feat = _voxel_grid(grid, resolution, vert_feat)
     sdf_sign, vert_feat = vert_feat[:, 0:1], vert_feat[:, 1:]
     sdf, deform = vert_feat[..., 0:1], vert_feat[..., 1:4]
     positions = Point.grid_to_coord(vert_coord + deform, matrix)
@@ -76,10 +148,10 @@ def _slab_pieces(rows: torch.Tensor, grid: torch.Tensor, resolution: int, matrix
             return None
         case_ids = fc._get_case_id_sparse(occ_fx8, surf_cubes, resolution, grid)
         surf_edges, idx_map, edge_counts, surf_edges_mask = fc._identify_surf_edges(sdf, cubes, surf_cubes)
-        vd, vd_idx_map = fc._compute_vd(positions, surf_edges, sdf, case_ids, idx_map)
+        vd, vd_idx_map = _dual_vertices(fc, positions, surf_edges, sdf, case_ids, idx_map)
     del positions, occ_fx8
 
-    # Each dual vertex's key, in the order _compute_vd numbers them: by vertex count of the cube,
+    # Each dual vertex's key, in the order _dual_vertices numbers them: by vertex count of the cube,
     # then cube, then index within the cube.
     device = rows.device
     surf_index = torch.nonzero(surf_cubes).squeeze(1)
