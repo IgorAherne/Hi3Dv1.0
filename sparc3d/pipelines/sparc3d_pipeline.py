@@ -1,4 +1,9 @@
-"""Batch-1 in-memory SPARC3D mesh refinement pipeline."""
+"""Batch-1 in-memory SPARC3D mesh refinement pipeline.
+
+Modified for Spellcast3D: the zero condition marked as such (sparc3d.nn.accel), the guidance interval decided
+from the schedule's host copy (no device synchronisation per evaluation), and a guided evaluation's two predictions
+from the transformer's forward_guided (the part before the condition is seen computed once).
+"""
 
 from __future__ import annotations
 
@@ -404,19 +409,29 @@ class Sparc3DPipeline:
             device="cpu",
             dtype=torch.float32,
         ).to(self._device)
+        from sparc3d.nn import accel
+
         sample = SparseTensor(feats=noise, coords=batched_coords)
-        negative_condition = torch.zeros_like(condition)
+        negative_condition = accel.zero_condition_like(condition)
         timesteps = self.scheduler.set_timesteps(
             num_inference_steps,
             num_tokens=coords.shape[0],
             device=self._device,
+        )
+        # Host copies of the schedule for the guidance interval's test (the same values).
+        times = timesteps.tolist() if accel.on("host_times") else None
+        sigmas = (
+            self.scheduler.sigmas.tolist()
+            if accel.on("host_times") and getattr(self.scheduler, "sigmas", None) is not None
+            else None
         )
 
         second_order = getattr(self.scheduler, "order", 1) == 2
 
         for step_index, sigma_hat in enumerate(timesteps):
             velocity = self._guided_velocity(
-                transformer, sample, sigma_hat, condition, negative_condition
+                transformer, sample, sigma_hat, condition, negative_condition,
+                time_value=times[step_index] if times is not None else None,
             )
             if second_order:
                 # Both slopes are guided at their own time, so an update that
@@ -430,6 +445,7 @@ class Sparc3DPipeline:
                     next_sigma,
                     condition,
                     negative_condition,
+                    time_value=sigmas[step_index + 1] if sigmas is not None else None,
                 )
                 updated = self.scheduler.step(
                     velocity, sigma_hat, sample.feats, second_output=second_velocity
@@ -458,13 +474,24 @@ class Sparc3DPipeline:
         timestep: torch.Tensor,
         condition: torch.Tensor,
         negative_condition: torch.Tensor,
+        time_value: float | None = None,
     ) -> torch.Tensor:
-        """Predict one flow velocity, guided only from time 0.7 upwards."""
+        """Predict one flow velocity, guided only from time 0.7 upwards.
+
+        ``time_value``: ``float(timestep)``, when the caller has it on the host.
+        """
+        from sparc3d.nn import accel
         from sparc3d.schedulers.schedule import apply_effective_guidance
 
         model_timestep = (1000.0 * timestep).reshape(1)
+        guided = (float(timestep) if time_value is None else time_value) >= 0.7
+        if guided and accel.on("shared_prefix") and hasattr(transformer, "forward_guided"):
+            positive, negative = transformer.forward_guided(
+                sample, model_timestep, condition, negative_condition
+            )
+            return apply_effective_guidance(positive.feats, negative.feats, timestep)
         positive = transformer(sample, model_timestep, condition)
-        if float(timestep) < 0.7:
+        if not guided:
             return positive.feats
         negative = transformer(sample, model_timestep, negative_condition)
         return apply_effective_guidance(positive.feats, negative.feats, timestep)

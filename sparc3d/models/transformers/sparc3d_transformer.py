@@ -2,6 +2,9 @@
 
 # Adapted from Microsoft TRELLIS under the MIT License.
 # Modified for SPARC3D: the released sparse inference architecture.
+# Modified for Spellcast3D: the zero condition (sparc3d.nn.accel.zero_condition_like) handed to the blocks as such;
+# the upsampling residual block normalises before it upsamples (the same rows, a quarter of the float32 memory);
+# forward_guided: a conditional and an unconditional prediction sharing the part before the first cross-attention.
 
 from __future__ import annotations
 
@@ -12,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sparc3d.nn import LayerNorm32
+from sparc3d.nn import LayerNorm32, accel
 from sparc3d.nn.sparse import (
     SparseConv3d,
     SparseDownsample,
@@ -132,6 +135,13 @@ class SparseResBlock3d(nn.Module):
     def forward(self, x: SparseTensor, embedding: torch.Tensor) -> SparseTensor:
         """Apply residual convolution and optional paired resampling."""
         scale, shift = self.emb_layers(embedding).to(x.dtype).chunk(2, dim=1)
+        if (
+            accel.on("upsample")
+            and self.upsample
+            and isinstance(self.skip_connection, SparseLinear)
+            and not torch.is_grad_enabled()
+        ):
+            return self._upsampling_forward(x, scale, shift)
         if self.updown is not None:
             x = self.updown(x)
         h = x.replace(self.norm1(x.feats))
@@ -142,6 +152,47 @@ class SparseResBlock3d(nn.Module):
         h = self.conv2(h)
         h = h.replace(F.silu(h.feats))
         return self.linear(h) + self.skip_connection(x)
+
+    def _upsampling_forward(
+        self, x: SparseTensor, scale: torch.Tensor, shift: torch.Tensor
+    ) -> SparseTensor:
+        """``forward`` of an upsampling block with its LayerNorm and SiLU before the upsample.
+
+        The upsample copies each token's row to its voxels, so the LayerNorm and the SiLU
+        (row-wise) give the same rows on the tokens, copied after them, as on the copies:
+        the voxel-level float32 normalisation (ten bytes a voxel and channel at its peak)
+        is never made. The skip projection runs on the voxel rows as before (a GEMM over
+        another row count may round differently), its input freed at once; with the item
+        ``upsample_token_skip`` (accel.EXTRA) it runs on the tokens instead, a rounding change.
+        """
+        coords, layout, inverse, voxel_scale = self.updown.mapping(x)
+        if accel.extra("upsample_token_skip"):
+            skip = self.skip_connection(x).feats[inverse]
+        else:
+            skip = nn.Linear.forward(self.skip_connection, x.feats[inverse])
+        rows = accel.ROW_CHUNK
+        normed = torch.empty_like(x.feats)
+        for start in range(0, normed.shape[0], rows):
+            part = self.norm1(x.feats[start:start + rows])
+            normed[start:start + rows] = F.silu(part)
+            del part
+        voxels = SparseTensor(
+            normed[inverse],
+            coords,
+            shape=x.shape,
+            layout=layout,
+            scale=voxel_scale,
+            spatial_cache=x._spatial_cache,
+            trusted=True,
+        )
+        del normed
+        h = self.conv1(voxels)
+        del voxels
+        h = h.replace(self.norm2(h.feats)) * (1 + scale) + shift
+        h = h.replace(F.silu(h.feats))
+        h = self.conv2(h)
+        h = h.replace(F.silu(h.feats))
+        return self.linear(h) + skip
 
 
 class Sparc3DTransformer(nn.Module):
@@ -253,6 +304,35 @@ class Sparc3DTransformer(nn.Module):
         self, x: SparseTensor, timestep: torch.Tensor, cond: torch.Tensor
     ) -> SparseTensor:
         """Predict latent flow for sparse ``x`` under image ``cond``."""
+        self._check_inputs(x, timestep, cond)
+        h, skips, convolution_embedding, modulation = self._prefix(x, timestep)
+        return self._rest(h, skips, convolution_embedding, modulation, cond, x.dtype)
+
+    def forward_guided(
+        self,
+        x: SparseTensor,
+        timestep: torch.Tensor,
+        cond: torch.Tensor,
+        negative: torch.Tensor,
+    ) -> tuple[SparseTensor, SparseTensor]:
+        """``forward(x, timestep, cond)`` and ``forward(x, timestep, negative)``.
+
+        Everything before the first block's cross-attention (the input layer and blocks,
+        the timestep embedding, the first block's self-attention) does not see the
+        condition, so the pair computes it once: the same two answers, bit for bit.
+        """
+        self._check_inputs(x, timestep, cond)
+        self._check_inputs(x, timestep, negative)
+        h, skips, convolution_embedding, modulation = self._prefix(x, timestep)
+        h = self.blocks[0].self_attention_part(h, modulation)
+        return tuple(
+            self._rest(h, skips, convolution_embedding, modulation, c, x.dtype, first_done=True)
+            for c in (cond, negative)
+        )
+
+    def _check_inputs(
+        self, x: SparseTensor, timestep: torch.Tensor, cond: torch.Tensor
+    ) -> None:
         if x.shape[0] != timestep.shape[0] or x.shape[0] != cond.shape[0]:
             raise ValueError("sparse input, timestep, and condition batches must match")
         if x.feats.shape[1] != self.config.in_channels:
@@ -260,6 +340,10 @@ class Sparc3DTransformer(nn.Module):
                 f"expected {self.config.in_channels} input channels, "
                 f"got {x.feats.shape[1]}"
             )
+
+    def _prefix(
+        self, x: SparseTensor, timestep: torch.Tensor
+    ) -> tuple[SparseTensor, list[torch.Tensor], torch.Tensor, torch.Tensor]:
         h = self.input_layer(x).type(self.dtype)
         timestep_embedding = self.t_embedder(timestep)
         convolution_embedding = timestep_embedding.to(self.dtype)
@@ -269,12 +353,29 @@ class Sparc3DTransformer(nn.Module):
             skips.append(h.feats)
 
         modulation = self.adaLN_modulation(timestep_embedding).to(self.dtype)
+        return h, skips, convolution_embedding, modulation
+
+    def _rest(
+        self,
+        h: SparseTensor,
+        skips: list[torch.Tensor],
+        convolution_embedding: torch.Tensor,
+        modulation: torch.Tensor,
+        cond: torch.Tensor,
+        out_dtype: torch.dtype,
+        first_done: bool = False,
+    ) -> SparseTensor:
+        """The blocks (the first from its cross-attention on when ``first_done``) and the output blocks."""
         context = cond.to(self.dtype)
-        for block in self.blocks:
-            h = block(h, modulation, context)
+        zero_context = accel.is_zero_condition(cond)
+        for index, block in enumerate(self.blocks):
+            if index == 0 and first_done:
+                h = block.context_part(h, modulation, context, zero_context)
+            else:
+                h = block(h, modulation, context, zero_context=zero_context)
 
         for block, skip in zip(self.out_blocks, reversed(skips)):
             h = h.replace(torch.cat((h.feats, skip), dim=1))
             h = block(h, convolution_embedding)
         h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
-        return self.out_layer(h.type(x.dtype))
+        return self.out_layer(h.type(out_dtype))

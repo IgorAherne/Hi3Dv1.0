@@ -2,12 +2,14 @@
 
 # Adapted from Microsoft TRELLIS under the MIT License.
 # Modified for SPARC3D: variable-length flash attention only.
-# Modified for Spellcast3D: PyTorch's attention where flash-attn is missing or the card predates sm_80.
+# Modified for Spellcast3D: PyTorch's attention where flash-attn is missing or the card predates sm_80; an
+# engine's self-attention kernel for one sequence (sparc3d.nn.accel.self_attention).
 
 from __future__ import annotations
 
 import torch
 
+from ... import accel
 from ..basic import SparseTensor
 from .backend import flash_attn_for, sdpa_spans
 
@@ -42,8 +44,13 @@ def sparse_scaled_dot_product_attention(
     """
     if not isinstance(query, SparseTensor):
         raise TypeError("Sparc3D sparse attention requires sparse queries")
-    flash_attn = flash_attn_for(query.device)
     query_lengths = _lengths(query)
+    if kv is None and accel.ENABLED and accel.self_attention is not None and len(query_lengths) == 1:
+        q, k, v = query.feats.unbind(dim=1)
+        output = accel.self_attention(q[None], k[None], v[None])
+        if output is not None:
+            return query.replace(output.reshape(q.shape))
+    flash_attn = flash_attn_for(query.device)
     if flash_attn is None:
         return query.replace(_sdpa(query.feats, kv, query_lengths))
     cumulative_query = _cumulative(query_lengths, query.device)

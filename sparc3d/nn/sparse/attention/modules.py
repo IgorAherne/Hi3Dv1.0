@@ -2,6 +2,8 @@
 
 # Adapted from Microsoft TRELLIS under the MIT License.
 # Modified for SPARC3D: full flash attention with spatial RoPE.
+# Modified for Spellcast3D: the rotary phases once per pass, q and k written back into the packed qkv, the zero
+# condition's cross-attention row once per token count (sparc3d.nn.accel; the same numbers bit for bit).
 
 from __future__ import annotations
 
@@ -9,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from ... import accel
 from ...rope import RotaryPositionEmbedder
 from ..basic import SparseTensor
 from .full_attn import sparse_scaled_dot_product_attention
@@ -29,6 +32,10 @@ class SparseMultiHeadRMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize the head dimension in float32 and restore ``x``'s dtype."""
+        if accel.on("rms_inplace") and not torch.is_grad_enabled():
+            # The same two products, in place.
+            y = F.normalize(x.float(), dim=-1)
+            return y.mul_(self.gamma).mul_(self.scale).to(x.dtype)
         return (F.normalize(x.float(), dim=-1) * self.gamma * self.scale).to(x.dtype)
 
 
@@ -78,6 +85,7 @@ class SparseMultiHeadAttention(nn.Module):
             self.to_q = nn.Linear(channels, channels, bias=True)
             self.to_kv = nn.Linear(self.ctx_channels, channels * 2, bias=True)
         self.to_out = nn.Linear(channels, channels)
+        self._zero_rows: dict[tuple, torch.Tensor] = {}
 
     @staticmethod
     def _linear(
@@ -103,11 +111,24 @@ class SparseMultiHeadAttention(nn.Module):
         if self._type == "self":
             qkv = self._fused_pre(self._linear(self.to_qkv, x), 3)
             assert isinstance(qkv, SparseTensor)
+            if accel.fused_for(qkv.feats) and self.head_dim == 96 and qkv.feats.is_contiguous():
+                from ... import fused
+
+                fused.rope_rms_(qkv.feats, self._rope_phases(qkv), self.q_rms_norm.gamma,
+                                self.k_rms_norm.gamma, self.q_rms_norm.scale)
+                return self._attend_out(qkv)
             q, k, v = qkv.feats.unbind(dim=1)
-            q, k = self.rope(q, k, qkv.coords[:, 1:])
+            phases = self._rope_phases(qkv) if accel.on("rope_cache") else None
+            q, k = self.rope(q, k, qkv.coords[:, 1:], phases)
             q = self.q_rms_norm(q)
             k = self.k_rms_norm(k)
-            qkv = qkv.replace(torch.stack((q, k, v), dim=1))
+            if accel.on("qkv_inplace") and not torch.is_grad_enabled():
+                # The values torch.stack would pack, written over the projections.
+                qkv.feats[:, 0] = q
+                qkv.feats[:, 1] = k
+                del q, k, v
+            else:
+                qkv = qkv.replace(torch.stack((q, k, v), dim=1))
             output = sparse_scaled_dot_product_attention(qkv)
         else:
             if context is None:
@@ -121,3 +142,37 @@ class SparseMultiHeadAttention(nn.Module):
         projected = self._linear(self.to_out, output)
         assert isinstance(projected, SparseTensor)
         return projected
+
+    def _attend_out(self, qkv: SparseTensor) -> SparseTensor:
+        output = sparse_scaled_dot_product_attention(qkv).reshape(-1)
+        return self._linear(self.to_out, output)
+
+    def _rope_phases(self, qkv: SparseTensor) -> torch.Tensor:
+        """The rotary phases of the tokens' coordinates, computed once per spatial cache."""
+        key = f"rope_phases_{self.head_dim}"
+        phases = qkv.get_spatial_cache(key)
+        if phases is None:
+            phases = self.rope.phases(qkv.coords[:, 1:])
+            qkv.register_spatial_cache(key, phases)
+        return phases
+
+    def _zero_key(self, x: SparseTensor) -> tuple:
+        return (x.feats.shape[0], x.feats.dtype, x.device, id(self.to_kv), id(self.to_out))
+
+    def zero_context_row(self, x: SparseTensor) -> torch.Tensor | None:
+        """The output row ``zero_context`` found for ``x``'s token count, or None yet."""
+        return self._zero_rows.get(self._zero_key(x))
+
+    def zero_context(self, h: SparseTensor, context: torch.Tensor) -> SparseTensor:
+        """Cross-attention to an all-zero ``context``, ``h`` the normalised queries.
+
+        Zero context tokens project to ``to_kv``'s bias: identical keys, so every query
+        weighs the identical values uniformly and every token gets the same output row.
+        This runs the full path and keeps that row (when every token's row is equal) for
+        ``zero_context_row``: ``[1, C]``, which the residual add broadcasts.
+        """
+        output = self(h, context)
+        first = output.feats[:1]
+        if torch.equal(output.feats, first.expand_as(output.feats)):
+            self._zero_rows = {self._zero_key(h): first.clone()}
+        return output

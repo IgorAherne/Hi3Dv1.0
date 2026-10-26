@@ -5,6 +5,8 @@
 # ``1000 * t`` model time originate with Microsoft TRELLIS; the token-count
 # warp, the two-level gamma, and the guidance interval are specific to these
 # checkpoints. Changing any of these constants changes the output geometry.
+# Modified for Spellcast3D: a scheduled timestep handed back as the schedule's own element is
+# recognised without a device synchronisation (sparc3d.nn.accel).
 
 from __future__ import annotations
 
@@ -80,6 +82,20 @@ def apply_effective_guidance(
         )
     return negative_prediction + scale * (
         positive_prediction - negative_prediction
+    )
+
+
+def _same_element(timestep: float | Tensor, expected: Tensor) -> bool:
+    """Whether ``timestep`` is ``expected`` itself (the schedule's element handed back)."""
+    from sparc3d.nn import accel
+
+    return (
+        accel.on("host_times")
+        and isinstance(timestep, Tensor)
+        and timestep.dtype == expected.dtype
+        and timestep.device == expected.device
+        and timestep.numel() == 1
+        and timestep.data_ptr() == expected.data_ptr()
     )
 
 
@@ -222,14 +238,17 @@ class FlowMatchSchedule:
             )
 
         expected = self.timesteps[self._step_index]
-        actual = torch.as_tensor(timestep, device=expected.device, dtype=expected.dtype)
-        if actual.numel() != 1 or not torch.isclose(
-            actual.reshape(()), expected, rtol=1e-5, atol=1e-6
-        ):
-            raise ValueError(
-                f"expected timestep {expected.item():.8g} at step "
-                f"{self._step_index}, got {timestep!r}"
+        if not _same_element(timestep, expected):
+            actual = torch.as_tensor(
+                timestep, device=expected.device, dtype=expected.dtype
             )
+            if actual.numel() != 1 or not torch.isclose(
+                actual.reshape(()), expected, rtol=1e-5, atol=1e-6
+            ):
+                raise ValueError(
+                    f"expected timestep {expected.item():.8g} at step "
+                    f"{self._step_index}, got {timestep!r}"
+                )
 
         next_sigma = self.sigmas[self._step_index + 1]
         step_size = (expected - next_sigma).to(

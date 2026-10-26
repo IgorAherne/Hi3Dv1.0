@@ -2,6 +2,7 @@
 
 # Adapted from Microsoft TRELLIS under the MIT License.
 # Modified for SPARC3D to route convolution through ``ops.sparse_backend``.
+# Modified for Spellcast3D: the index pairs kept for later tensors over the same coordinates.
 
 from __future__ import annotations
 
@@ -79,10 +80,12 @@ class SparseConv3d(nn.Module):
     def forward(self, x: SparseTensor) -> SparseTensor:
         """Convolve ``x`` while preserving its coordinate lineage."""
         output = self.conv(x.backend_data())
+        x.keep_index_pairs(output)
         return SparseTensor(
             data=output,
             shape=x.shape[:1] + (self.out_channels,),
             layout=x.layout,
             scale=x.scale,
             spatial_cache=x._spatial_cache,
+            trusted=True,
         )

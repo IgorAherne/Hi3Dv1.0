@@ -2,6 +2,9 @@
 
 # Adapted from Microsoft TRELLIS under the MIT License.
 # Modified for SPARC3D to use the local sparse backend and paired resampling cache.
+# Modified for Spellcast3D: no host synchronisation where the shape and layout are known, a modulation row
+# broadcast instead of materialised, and the backend tensor's grid and index pairs kept in the spatial cache
+# (sparc3d.nn.accel; the same numbers bit for bit).
 
 from __future__ import annotations
 
@@ -10,6 +13,7 @@ from typing import Any
 
 import torch
 
+from sparc3d.nn import accel
 from sparc3d.ops import sparse_backend
 
 
@@ -26,6 +30,7 @@ class SparseTensor:
         data: Any | None = None,
         scale: tuple[int, ...] = (1, 1, 1),
         spatial_cache: dict[str, dict[str, Any]] | None = None,
+        trusted: bool = False,
     ):
         """
         Args:
@@ -40,6 +45,9 @@ class SparseTensor:
                 differ between nesting levels.
             spatial_cache: Cache shared with tensors over the same geometry, which is
                 how a downsample hands its inverse mapping to the paired upsample.
+            trusted: ``shape`` and ``layout`` come from a tensor over the same
+                coordinates; with ``accel.ENABLED`` they are not re-derived or checked
+                (no host synchronisation).
 
         Raises:
             ValueError: Both ``data`` and explicit features or coordinates were given,
@@ -61,12 +69,18 @@ class SparseTensor:
         self._feats = feats
         self._coords = coords.int().contiguous()
         self.data = data
-        batch_size = int(self._coords[:, 0].max().item()) + 1
-        self._shape = shape or torch.Size((batch_size, *feats.shape[1:]))
-        self._layout = layout or self._calculate_layout(self._coords, batch_size)
+        trusted = trusted and accel.on("sync") and bool(shape) and bool(layout)
+        if not trusted:
+            batch_size = int(self._coords[:, 0].max().item()) + 1
+            self._shape = shape or torch.Size((batch_size, *feats.shape[1:]))
+            self._layout = layout or self._calculate_layout(self._coords, batch_size)
+        else:
+            self._shape = shape
+            self._layout = layout
         self._scale = tuple(scale)
         self._spatial_cache = spatial_cache if spatial_cache is not None else {}
-        self._validate_layout()
+        if not trusted:
+            self._validate_layout()
 
     @staticmethod
     def _calculate_layout(coords: torch.Tensor, batch_size: int) -> list[slice]:
@@ -85,8 +99,25 @@ class SparseTensor:
     def backend_data(self) -> Any:
         """Return the sparse-backend tensor, creating it lazily."""
         if self.data is None:
-            self.data = sparse_backend.sparse_tensor(self._feats, self._coords)
+            if accel.on("geometry"):
+                # The grid, batch size and the convolutions' index pairs of these
+                # coordinates, kept for every tensor sharing the spatial cache.
+                geometry = self.get_spatial_cache("backend_geometry")
+                if geometry is None:
+                    data = sparse_backend.sparse_tensor(self._feats, self._coords)
+                    geometry = sparse_backend.geometry_of(data)
+                    self.register_spatial_cache("backend_geometry", geometry)
+                self.data = sparse_backend.sparse_tensor_from(self._feats, self._coords, geometry)
+            else:
+                self.data = sparse_backend.sparse_tensor(self._feats, self._coords)
         return self.data
+
+    def keep_index_pairs(self, data: Any) -> None:
+        """Keep the index pairs a convolution over these coordinates computed into ``data``."""
+        if accel.on("geometry"):
+            geometry = self.get_spatial_cache("backend_geometry")
+            if geometry is not None:
+                sparse_backend.keep_index_pairs(geometry, data)
 
     @property
     def shape(self) -> torch.Size:
@@ -138,6 +169,7 @@ class SparseTensor:
             layout=self.layout,
             scale=self._scale,
             spatial_cache=self._spatial_cache,
+            trusted=True,
         )
 
     def reshape(self, *shape: int) -> "SparseTensor":
@@ -162,12 +194,19 @@ class SparseTensor:
         operation: Callable[[torch.Tensor, Any], torch.Tensor],
     ) -> "SparseTensor":
         if isinstance(other, SparseTensor):
-            if not torch.equal(self.coords, other.coords):
+            same = accel.on("sync") and other.coords is self.coords
+            if not same and not torch.equal(self.coords, other.coords):
                 raise ValueError("sparse operands must have identical coordinates")
             other = other.feats
         elif isinstance(other, torch.Tensor) and other.ndim >= 1:
             if other.shape[0] == self.shape[0] and other.shape != self.feats.shape:
-                other = sparse_batch_broadcast(self, other)
+                if (accel.on("broadcast") and len(self.layout) == 1
+                        and other.shape[1:] == self.feats.shape[1:]):
+                    # One batch: the row in the features' dtype, broadcast by the
+                    # operation, gives the values the materialised copy gives.
+                    other = other[0].to(self.feats.dtype)
+                else:
+                    other = sparse_batch_broadcast(self, other)
         return self.replace(operation(self.feats, other))
 
     def __add__(self, other):

@@ -2,11 +2,14 @@
 
 # Adapted from Microsoft TRELLIS under the MIT License.
 # Modified for SPARC3D to retain the sparse feed-forward path only.
+# Modified for Spellcast3D: the GELU in place on the hidden layer (the same values, one hidden layer less).
 
 from __future__ import annotations
 
+import torch
 from torch import nn
 
+from ... import accel
 from ..basic import SparseTensor
 from ..linear import SparseLinear
 from ..nonlinearity import SparseGELU
@@ -31,4 +34,15 @@ class SparseFeedForwardNet(nn.Module):
 
     def forward(self, x: SparseTensor) -> SparseTensor:
         """Transform sparse features with the MLP."""
-        return self.mlp(x)
+        mlp = self.mlp
+        if (
+            accel.on("gelu_inplace")
+            and not torch.is_grad_enabled()
+            and isinstance(mlp, nn.Sequential)
+            and len(mlp) == 3
+            and type(mlp[1]) is SparseGELU
+        ):
+            h = mlp[0](x)
+            torch.ops.aten.gelu_(h.feats, approximate=mlp[1].approximate)
+            return mlp[2](h)
+        return mlp(x)
