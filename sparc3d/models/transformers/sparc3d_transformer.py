@@ -4,7 +4,8 @@
 # Modified for SPARC3D: the released sparse inference architecture.
 # Modified for Spellcast3D: the zero condition (sparc3d.nn.accel.zero_condition_like) handed to the blocks as such;
 # the upsampling residual block normalises before it upsamples (the same rows, a quarter of the float32 memory);
-# forward_guided: a conditional and an unconditional prediction sharing the part before the first cross-attention.
+# forward_guided: a conditional and an unconditional prediction sharing the part before the first cross-attention;
+# the timestep frequencies copied to the card once a process (sparc3d.nn.accel's sync saving).
 
 from __future__ import annotations
 
@@ -27,6 +28,23 @@ from sparc3d.nn.sparse.transformer import ModulatedSparseTransformerCrossBlock
 from sparc3d.nn.utils import convert_module_to_f16, zero_module
 
 from .config import Sparc3DTransformerConfig
+
+
+_FREQUENCIES: dict[tuple[int, int, torch.device], torch.Tensor] = {}
+
+
+def _frequencies(half: int, max_period: int, device: torch.device) -> torch.Tensor:
+    """The sinusoids' frequencies computed on the host as the original line does (the same bits) and copied to
+    ``device`` once a process instead of every forward (a synchronising copy)."""
+    key = (half, max_period, device)
+    frequencies = _FREQUENCIES.get(key)
+    if frequencies is None:
+        with torch.inference_mode(False):       # a normal tensor, usable outside inference mode too
+            frequencies = torch.exp(
+                -math.log(max_period) * torch.arange(half, dtype=torch.float32) / half
+            ).to(device)
+        _FREQUENCIES[key] = frequencies
+    return frequencies
 
 
 class TimestepEmbedder(nn.Module):
@@ -61,9 +79,12 @@ class TimestepEmbedder(nn.Module):
             Embeddings ``[B, dim]``.
         """
         half = dim // 2
-        frequencies = torch.exp(
-            -math.log(max_period) * torch.arange(half, dtype=torch.float32) / half
-        ).to(timestep.device)
+        if accel.on("sync"):
+            frequencies = _frequencies(half, max_period, timestep.device)
+        else:
+            frequencies = torch.exp(
+                -math.log(max_period) * torch.arange(half, dtype=torch.float32) / half
+            ).to(timestep.device)
         arguments = timestep[:, None].float() * frequencies[None]
         embedding = torch.cat((torch.cos(arguments), torch.sin(arguments)), dim=-1)
         if dim % 2:

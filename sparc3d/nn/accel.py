@@ -12,8 +12,8 @@ process) turns the work on or off:
 fused Triton kernels (sparc3d.nn.fused) - a change of rounding, not bit for bit, so off unless asked for.
 
 Per-pass caches (the sample's coordinates are fixed through a pass, and the sample tensors of a pass share one
-spatial cache): the downsample's mapping, spconv's index pairs and grid, the rotary phases, and the zero
-condition's cross-attention row (``to_kv`` of zeros is its bias, so every token attends uniformly to one value row
+spatial cache): the downsample's mapping, spconv's index pairs and grid, the rotary phases, flash-attn's cumulative
+sequence lengths, and the zero condition's cross-attention row (``to_kv`` of zeros is its bias, so every token attends uniformly to one value row
 whatever its query: the row ``to_out`` makes of it is computed by the full path once per token count and reused).
 
 Hooks an engine may set (``None``: the built-in path):
