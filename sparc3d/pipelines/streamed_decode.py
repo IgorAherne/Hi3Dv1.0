@@ -89,7 +89,8 @@ class StreamedMesh:
     peak_alloc_mib: float = 0.0
     peak_reserved_mib: float = 0.0
     host_mib: float = 0.0
-    """Page-locked host memory the decode used at most (stores that did not fit on the card)."""
+    """Host memory the decode's stores used at most (those that did not fit on the card; page-locked unless
+    the system refused it)."""
     sweeps: list = field(default_factory=list)
 
 

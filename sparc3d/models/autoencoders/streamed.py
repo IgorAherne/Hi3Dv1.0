@@ -21,8 +21,13 @@ deliberate difference: GroupNorm moments are summed in float64 over a canonical 
 
 from __future__ import annotations
 
+import ctypes
+import functools
+import glob
 import itertools
 import mmap
+import os
+import sys
 import time
 import warnings
 from dataclasses import dataclass
@@ -253,38 +258,81 @@ _REGISTER_MIN_BYTES = 64 << 20
 from PyTorch's pinned allocator (which rounds a block up to a power of two, a waste only on big ones)."""
 
 
-def page_locked(shape: tuple[int, ...], dtype: torch.dtype) -> tuple[torch.Tensor, mmap.mmap | None]:
-    """A page-locked host tensor, and the anonymous mapping under it when it is a big one.
+@functools.lru_cache(maxsize=None)
+def _cuda_runtime():
+    """PyTorch's own CUDA runtime library (the one ``torch.cuda.cudart()`` calls), through ctypes, or None."""
+    folder = os.path.join(os.path.dirname(torch.__file__), "lib")
+    if os.name == "nt":
+        names = sorted(glob.glob(os.path.join(folder, "cudart64_*.dll")))
+    else:
+        major = (torch.version.cuda or "12").split(".")[0]
+        names = [f"libcudart.so.{major}"] + sorted(glob.glob(os.path.join(
+            os.path.dirname(os.path.dirname(torch.__file__)), "nvidia", "cuda_runtime", "lib", "libcudart.so.*")))
+    for name in names:
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    return None
+
+
+def clear_cuda_error() -> None:
+    """Reset the CUDA runtime's last error after a failed call whose failure is handled here: left set,
+    the next kernel-launch check anywhere would raise it (``torch.cuda.cudart()`` has no
+    ``cudaGetLastError``)."""
+    runtime = _cuda_runtime()
+    if runtime is not None:
+        runtime.cudaGetLastError()
+
+
+def page_locked(shape: tuple[int, ...], dtype: torch.dtype) -> tuple[torch.Tensor, mmap.mmap | None, str | None]:
+    """A host tensor for a store: ``(tensor, the anonymous mapping under it when it is a big one, why it
+    is not page-locked or None)``.
 
     Big blocks come straight from the OS: PyTorch's CPU allocator was seen to keep freed 1.5 GB tensors
     (neither given back nor reused), so a decode per pass would grow the process by its stores each time.
-    The mapping must be unregistered and closed once no tensor uses it (:meth:`Store.free`)."""
+    The mapping must be unregistered and closed once no tensor uses it (:meth:`Store.free`). When memory
+    cannot be page-locked (the page file, the driver), the tensor is plain pageable memory: its copies
+    then run synchronously, which the streams' ordering allows."""
     nbytes = torch.Size(shape).numel() * torch.empty((), dtype=dtype).element_size()
     if nbytes < _REGISTER_MIN_BYTES:
-        return torch.empty(shape, dtype=dtype, pin_memory=True), None
-    mapping = mmap.mmap(-1, nbytes)
+        try:
+            return torch.empty(shape, dtype=dtype, pin_memory=True), None, None
+        except RuntimeError as error:
+            clear_cuda_error()
+            return torch.empty(shape, dtype=dtype), None, f"pinned allocation failed ({error})"
+    try:
+        mapping = mmap.mmap(-1, nbytes)
+    except OSError as error:
+        return torch.empty(shape, dtype=dtype), None, f"no {nbytes >> 20} MiB mapping ({error})"
     tensor = torch.frombuffer(mapping, dtype=dtype).view(shape)
-    if int(torch.cuda.cudart().cudaHostRegister(tensor.data_ptr(), nbytes, 0)) != 0:
-        del tensor
-        mapping.close()
-        raise RuntimeError(f"could not page-lock {nbytes >> 20} MiB of host memory")
-    return tensor, mapping
+    code = int(torch.cuda.cudart().cudaHostRegister(tensor.data_ptr(), nbytes, 0))
+    if code != 0:
+        clear_cuda_error()
+        return tensor, mapping, f"cudaHostRegister of {nbytes >> 20} MiB failed (CUDA error {code})"
+    return tensor, mapping, None
 
 
 class Store:
-    """The rows of one level tensor, on the card or in page-locked host memory."""
+    """The rows of one level tensor, on the card or in (page-locked when possible) host memory."""
 
-    def __init__(self, data: torch.Tensor, streams: Streams, device: torch.device, mapping: mmap.mmap | None = None):
+    def __init__(self, data: torch.Tensor, streams: Streams, device: torch.device, mapping: mmap.mmap | None = None,
+                 registered: bool = False):
         self.data, self.streams, self.device, self.mapping = data, streams, torch.device(device), mapping
+        self.registered = registered
         self.on_card = data.device.type == self.device.type
+        self.pageable: str | None = None
+        """Why a host store is not page-locked (None when it is)."""
 
     @staticmethod
     def empty(rows: int, channels: int, dtype: torch.dtype, on_card: bool, streams: Streams,
               device: torch.device) -> "Store":
         if on_card:
             return Store(torch.empty((rows, channels), dtype=dtype, device=device), streams, device)
-        data, mapping = page_locked((rows, channels), dtype)
-        return Store(data, streams, device, mapping)
+        data, mapping, pageable = page_locked((rows, channels), dtype)
+        store = Store(data, streams, device, mapping, registered=mapping is not None and pageable is None)
+        store.pageable = pageable
+        return store
 
     @property
     def dtype(self) -> torch.dtype:
@@ -327,7 +375,13 @@ class Store:
         if self.mapping is not None:
             self.streams.h2d.synchronize()
             self.streams.d2h.synchronize()
-            torch.cuda.cudart().cudaHostUnregister(self.data.data_ptr())
+            if self.registered:
+                self.registered = False
+                code = int(torch.cuda.cudart().cudaHostUnregister(self.data.data_ptr()))
+                if code != 0:
+                    clear_cuda_error()
+                    warnings.warn(f"cudaHostUnregister failed (CUDA error {code}); the block is given back "
+                                  "to the OS all the same", stacklevel=2)
             self.data = None
             mapping, self.mapping = self.mapping, None
             try:
@@ -675,6 +729,7 @@ class StreamedDecoder:
         self.sweeps: list[dict] = []
         self.host_bytes = self.host_peak = 0
         self.peak_alloc = self.peak_reserved = 0.0
+        self.pageable_warned = False
 
     def _store(self, name: str, index: int, rows: int, channels: int, dtype: torch.dtype, kind: str,
                channels_in: int) -> Store:
@@ -686,6 +741,11 @@ class StreamedDecoder:
             self.host_peak = max(self.host_peak, self.host_bytes)
         store = Store.empty(rows, channels, dtype, on_card, self.streams, self.device)
         store.name = name
+        if store.pageable and not self.pageable_warned:
+            self.pageable_warned = True
+            print(f"[sparc3d] streamed decode: host memory could not be page-locked ({store.pageable}); "
+                  "stores off the card use pageable memory, their copies run synchronously", file=sys.stderr,
+                  flush=True)
         return store
 
     def _release(self) -> None:
